@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "opensearch-architect": {
+      "command": "python3.11",
+      "args": ["-m", "opensearch_mcp.server"],
+      "cwd": "/Users/mfenqin/workspace/agent/opensearch-architect-power/servers/opensearch-mcp",
+      "env": {
+        "PYTHONPATH": "/Users/mfenqin/workspace/agent/opensearch-architect-power/servers/opensearch-mcp",
+        "OPENSEARCH_HOST": "localhost",
+        "OPENSEARCH_PORT": "9200",
+        "OPENSEARCH_USER": "admin",
+        "OPENSEARCH_PASSWORD": "myStrongPassword123!",
+        "SEARCH_UI_PORT": "8765"
+      },
+      "disabled": false,
+      "autoApprove": [
+        "read_knowledge_base",
+        "read_dense_vector_models",
+        "read_sparse_vector_models",
+        "search_opensearch_org",
+        "get_sample_doc"
+      ]
+    }
+  }
+}
