@@ -109,13 +109,48 @@ class OrchestratorEngine:
         self._default_deployment = model_deployment_option_opensearch_node
         self._resume_marker = resume_marker
 
+    def _build_worker_context(self, additional_context: str = "") -> dict[str, object]:
+        if self.plan_result is None:
+            return {
+                "error": "No finalized plan available. Complete the planning phase first."
+            }
+
+        plan = self.plan_result
+        solution = plan.get("solution", "")
+        capabilities = plan.get("search_capabilities", "")
+        keynote = plan.get("keynote", "")
+
+        worker_context = (
+            f"Solution:\n{solution}\n\n"
+            f"Search Capabilities:\n{capabilities}\n\n"
+            f"Keynote:\n{keynote}"
+        )
+        if additional_context:
+            worker_context += f"\n\n{additional_context}"
+
+        return {
+            "execution_context": worker_context,
+            "plan": {
+                "solution": str(solution or ""),
+                "search_capabilities": str(capabilities or ""),
+                "keynote": str(keynote or ""),
+            },
+        }
+
     def reset(self) -> None:
         self._reset_state(self.state)
         self.phase = Phase.COLLECT_SAMPLE
         self.planning = None
         self.plan_result = None
 
-    def load_sample(self, source_type: str, source_value: str = "") -> dict:
+    def load_sample(
+        self,
+        source_type: str,
+        source_value: str = "",
+        localhost_auth_mode: str = "default",
+        localhost_auth_username: str = "",
+        localhost_auth_password: str = "",
+    ) -> dict:
         if source_type not in self._valid_source_types:
             return {
                 "error": (
@@ -148,7 +183,38 @@ class OrchestratorEngine:
                 }
             result = self._load_url_sample(source_value)
         elif source_type == "localhost_index":
-            result = self._load_localhost_index_sample(source_value)
+            normalized_mode = str(localhost_auth_mode or "").strip().lower()
+            if normalized_mode not in {"default", "none", "custom"}:
+                return {
+                    "error": (
+                        "Invalid localhost_auth_mode. Must be one of: "
+                        "default, none, custom."
+                    )
+                }
+            user = str(localhost_auth_username or "").strip()
+            password = str(localhost_auth_password or "").strip()
+            if normalized_mode == "custom" and (not user or not password):
+                return {
+                    "error": (
+                        "localhost_auth_mode='custom' requires both "
+                        "localhost_auth_username and localhost_auth_password."
+                    )
+                }
+
+            state.localhost_auth_mode = normalized_mode
+            if normalized_mode == "custom":
+                state.localhost_auth_username = user
+                state.localhost_auth_password = password
+            else:
+                state.localhost_auth_username = None
+                state.localhost_auth_password = None
+
+            result = self._load_localhost_index_sample(
+                source_value,
+                normalized_mode,
+                user,
+                password,
+            )
         else:
             if not source_value:
                 return {
@@ -210,23 +276,30 @@ class OrchestratorEngine:
 
         state.budget_preference = budget_val
         state.performance_priority = perf_val
-        state.hybrid_weight_profile = hw_val
+        text_search_disabled = state.inferred_text_search_required is False
 
-        if state.inferred_text_search_required and state.prefix_wildcard_enabled is None:
-            state.prefix_wildcard_enabled = False
-
-        if (
-            qp_val in self._deployment_required_query_patterns
-            and state.inferred_text_search_required
-        ):
-            dep_val = (
-                deployment_preference
-                if deployment_preference in self._valid_deployment
-                else self._default_deployment
-            )
-            state.model_deployment_preference = dep_val
-        else:
+        if text_search_disabled:
+            # Non-text datasets should not carry semantic-only preference state.
+            state.hybrid_weight_profile = None
             state.model_deployment_preference = None
+        else:
+            state.hybrid_weight_profile = hw_val
+
+            if state.inferred_text_search_required and state.prefix_wildcard_enabled is None:
+                state.prefix_wildcard_enabled = False
+
+            if (
+                qp_val in self._deployment_required_query_patterns
+                and state.inferred_text_search_required
+            ):
+                dep_val = (
+                    deployment_preference
+                    if deployment_preference in self._valid_deployment
+                    else self._default_deployment
+                )
+                state.model_deployment_preference = dep_val
+            else:
+                state.model_deployment_preference = None
 
         return {
             "budget": state.budget_preference,
@@ -296,23 +369,12 @@ class OrchestratorEngine:
         worker_executor: Any = None,
         worker_executor_async: Any = None,
     ) -> dict:
-        if self.plan_result is None:
-            return {
-                "error": "No finalized plan available. Complete the planning phase first."
-            }
-
-        plan = self.plan_result
-        solution = plan.get("solution", "")
-        capabilities = plan.get("search_capabilities", "")
-        keynote = plan.get("keynote", "")
-
-        worker_context = (
-            f"Solution:\n{solution}\n\n"
-            f"Search Capabilities:\n{capabilities}\n\n"
-            f"Keynote:\n{keynote}"
-        )
-        if additional_context:
-            worker_context += f"\n\n{additional_context}"
+        context_payload = self._build_worker_context(additional_context)
+        if "error" in context_payload:
+            return {"error": str(context_payload["error"])}
+        worker_context = str(context_payload.get("execution_context", "")).strip()
+        if not worker_context:
+            return {"error": "Failed to build execution context from finalized plan."}
 
         if worker_executor_async is not None:
             worker_result = await worker_executor_async(worker_context)
@@ -323,6 +385,14 @@ class OrchestratorEngine:
 
         self.phase = Phase.DONE
         return {"execution_report": worker_result}
+
+    def build_execution_context(
+        self,
+        *,
+        additional_context: str = "",
+    ) -> dict[str, object]:
+        """Build execution context without running the worker."""
+        return self._build_worker_context(additional_context)
 
     def set_plan(
         self,
@@ -359,16 +429,14 @@ class OrchestratorEngine:
         worker_executor: Any = None,
         worker_executor_async: Any = None,
     ) -> dict:
-        worker_state = self._get_last_worker_run_state()
-        recovery_context = (
-            str(worker_state.get("context", "")).strip()
-            if isinstance(worker_state, dict)
-            else ""
-        )
-        if not recovery_context:
+        context_payload = self.build_retry_execution_context()
+        if "error" in context_payload:
+            return {"error": str(context_payload["error"])}
+
+        resume_context = str(context_payload.get("execution_context", "")).strip()
+        if not resume_context:
             return {"error": "No checkpoint context available. Run execute_plan first."}
 
-        resume_context = f"{self._resume_marker}\n{recovery_context}"
         if worker_executor_async is not None:
             worker_result = await worker_executor_async(resume_context)
         elif worker_executor is not None:
@@ -380,3 +448,32 @@ class OrchestratorEngine:
         latest_status = str(latest_state.get("status", "")).lower()
         self.phase = Phase.DONE if latest_status == "success" else Phase.EXEC_FAILED
         return {"execution_report": worker_result}
+
+    def build_retry_execution_context(self) -> dict[str, object]:
+        """Build retry execution context without running the worker."""
+        worker_state = self._get_last_worker_run_state()
+        recovery_context = (
+            str(worker_state.get("context", "")).strip()
+            if isinstance(worker_state, dict)
+            else ""
+        )
+        if not recovery_context:
+            return {
+                "error": "No checkpoint context available. Run execute_plan first."
+            }
+
+        resume_context = f"{self._resume_marker}\n{recovery_context}"
+        return {
+            "execution_context": resume_context,
+            "failed_step": (
+                str(worker_state.get("failed_step", "")).strip()
+                if isinstance(worker_state, dict)
+                else ""
+            ),
+            "previous_steps": (
+                dict(worker_state.get("steps", {}))
+                if isinstance(worker_state, dict)
+                and isinstance(worker_state.get("steps", {}), dict)
+                else {}
+            ),
+        }

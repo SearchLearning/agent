@@ -127,9 +127,20 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 ## Workflow Phases
 
 ### Phase 1: Collect Sample Document (mandatory first step)
-- Call `load_sample(source_type, source_value)`.
+- Ask the user how they want to provide a sample document. Present as a numbered list:
+  1. Use built-in IMDB dataset
+  2. Load from a local file or URL
+  3. Load from a localhost OpenSearch index
+  4. Paste JSON directly
+- Based on the user choice, call `load_sample(source_type, source_value, localhost_auth_mode, localhost_auth_username, localhost_auth_password)`.
   - source_type: "builtin_imdb" | "local_file" | "url" | "localhost_index" | "paste"
   - source_value: file path, URL, index name, or pasted JSON content (empty string for builtin_imdb)
+  - localhost auth args are used only for `source_type="localhost_index"`:
+    - localhost_auth_mode: "default" | "none" | "custom"
+    - localhost_auth_username / localhost_auth_password: required only when mode is "custom"
+- For option 2, detect whether the user provided a local file path or URL and use `local_file` or `url`.
+- For option 3, ask for index name first and default to `localhost_auth_mode="default"` unless the user explicitly asks for `none` or `custom`.
+- For option 4, ask for 1-3 representative JSON records before calling `load_sample("paste", ...)`.
 - The result includes `inferred_text_fields` and `text_search_required`.
 - A sample document is required before any planning or execution.
 
@@ -195,7 +206,7 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 - After successful `execute_plan()`/`retry_execution()`, explicitly tell the user
   how to access the UI using the `ui_access` URLs returned by the tool result.
 - After Phase 5 AWS deployment, provide AWS endpoint URLs and configuration details.
-- `cleanup_verification()` removes test documents when the user explicitly asks.
+- `cleanup()` removes test documents when the user explicitly asks.
 
 ## Available Tools
 
@@ -210,7 +221,7 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 | `set_plan_from_planning_complete` | 3 | Parse/store finalized planner output for manual planning mode |
 | `execute_plan` | 4 | Execute the plan (create index, models, pipelines, UI) |
 | `retry_execution` | 4 | Resume from a failed execution step |
-| `cleanup_verification` | Post | Remove test documents on user request |
+| `cleanup` | Post | Remove test documents on user request |
 
 ### Knowledge Tools
 | Tool | Description |

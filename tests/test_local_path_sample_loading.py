@@ -147,6 +147,93 @@ def test_extract_index_candidate_from_index_name_phrase():
     assert detected == "yellow-tripdata"
 
 
+def test_create_local_opensearch_client_default_mode_uses_admin_credentials(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    class _FakeOpenSearch:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def info(self):
+            return {"version": {"number": "2.0.0"}}
+
+    import opensearchpy
+
+    monkeypatch.delenv("OPENSEARCH_AUTH_MODE", raising=False)
+    monkeypatch.delenv("OPENSEARCH_USER", raising=False)
+    monkeypatch.delenv("OPENSEARCH_PASSWORD", raising=False)
+    monkeypatch.setattr(opensearchpy, "OpenSearch", _FakeOpenSearch)
+
+    client, error = tools._create_local_opensearch_client()
+
+    assert error is None
+    assert client is not None
+    assert calls
+    assert calls[0].get("http_auth") == ("admin", "myStrongPassword123!")
+
+
+def test_create_local_opensearch_client_none_mode_uses_no_auth(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    class _FakeOpenSearch:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def info(self):
+            return {"version": {"number": "2.0.0"}}
+
+    import opensearchpy
+
+    monkeypatch.setenv("OPENSEARCH_AUTH_MODE", "none")
+    monkeypatch.delenv("OPENSEARCH_USER", raising=False)
+    monkeypatch.delenv("OPENSEARCH_PASSWORD", raising=False)
+    monkeypatch.setattr(opensearchpy, "OpenSearch", _FakeOpenSearch)
+
+    client, error = tools._create_local_opensearch_client()
+
+    assert error is None
+    assert client is not None
+    assert calls
+    assert "http_auth" not in calls[0]
+
+
+def test_create_local_opensearch_client_custom_mode_uses_supplied_credentials(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    class _FakeOpenSearch:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def info(self):
+            return {"version": {"number": "2.0.0"}}
+
+    import opensearchpy
+
+    monkeypatch.setenv("OPENSEARCH_AUTH_MODE", "custom")
+    monkeypatch.setenv("OPENSEARCH_USER", "customer-user")
+    monkeypatch.setenv("OPENSEARCH_PASSWORD", "customer-password")
+    monkeypatch.setattr(opensearchpy, "OpenSearch", _FakeOpenSearch)
+
+    client, error = tools._create_local_opensearch_client()
+
+    assert error is None
+    assert client is not None
+    assert calls
+    assert calls[0].get("http_auth") == ("customer-user", "customer-password")
+
+
+def test_create_local_opensearch_client_custom_mode_requires_credentials(monkeypatch):
+    monkeypatch.setenv("OPENSEARCH_AUTH_MODE", "custom")
+    monkeypatch.delenv("OPENSEARCH_USER", raising=False)
+    monkeypatch.delenv("OPENSEARCH_PASSWORD", raising=False)
+
+    client, error = tools._create_local_opensearch_client()
+
+    assert client is None
+    assert isinstance(error, str)
+    assert "requires OPENSEARCH_USER and OPENSEARCH_PASSWORD" in error
+
+
 def test_detect_imdb_and_localhost_index_intents():
     assert looks_like_builtin_imdb_sample_request("Use the sample IMDb dataset.")
     assert looks_like_localhost_index_message("Data is already in localhost index movies-index.")

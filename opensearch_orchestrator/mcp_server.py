@@ -7,7 +7,7 @@
 Clients (Cursor, Claude Desktop, generic MCP) call these tools in order:
   load_sample -> set_preferences -> start_planning -> refine_plan/finalize_plan -> execute_plan
 
-Low-level domain tools are also exposed for advanced use.
+Low-level domain tools can be optionally exposed for advanced use.
 """
 
 from __future__ import annotations
@@ -21,9 +21,11 @@ if __package__ in {None, ""}:
         sys.path.insert(0, _SCRIPT_EXECUTION_PROJECT_ROOT)
 
 import errno
+from contextlib import contextmanager
 import os
 import re
 import sys
+from typing import Any
 
 import anyio
 from mcp import types as mcp_types
@@ -31,6 +33,7 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from opensearch_orchestrator.orchestrator import create_transport_agnostic_engine
 from opensearch_orchestrator.planning_session import PlanningSession
+from opensearch_orchestrator.scripts.shared import Phase
 from opensearch_orchestrator.solution_planning_assistant import (
     SYSTEM_PROMPT as PLANNER_SYSTEM_PROMPT,
 )
@@ -49,20 +52,31 @@ from opensearch_orchestrator.scripts.tools import (
 from opensearch_orchestrator.scripts.opensearch_ops_tools import (
     SEARCH_UI_HOST,
     SEARCH_UI_PORT,
-    create_index,
-    create_and_attach_pipeline,
-    create_bedrock_embedding_model,
-    create_local_pretrained_model,
-    index_doc,
-    index_verification_docs,
-    delete_doc,
-    cleanup_verification_docs,
-    apply_capability_driven_verification,
-    preview_cap_driven_verification,
-    launch_search_ui,
-    cleanup_ui_server,
-    set_search_ui_suggestions,
+    create_index as create_index_impl,
+    create_and_attach_pipeline as create_and_attach_pipeline_impl,
+    create_bedrock_embedding_model as create_bedrock_embedding_model_impl,
+    create_local_pretrained_model as create_local_pretrained_model_impl,
+    index_doc as index_doc_impl,
+    index_verification_docs as index_verification_docs_impl,
+    delete_doc as delete_doc_impl,
+    cleanup_docs as cleanup_docs_impl,
+    apply_capability_driven_verification as apply_capability_driven_verification_impl,
+    preview_cap_driven_verification as preview_cap_driven_verification_impl,
+    launch_search_ui as launch_search_ui_impl,
+    cleanup_ui_server as cleanup_ui_server_impl,
+    set_search_ui_suggestions as set_search_ui_suggestions_impl,
+    RUNTIME_MODE_ENV,
+    RUNTIME_MODE_MCP,
 )
+from opensearch_orchestrator.worker import (
+    SYSTEM_PROMPT as WORKER_SYSTEM_PROMPT,
+    _RESUME_WORKER_MARKER,
+    build_worker_initial_input,
+    commit_execution_report,
+)
+
+# Force MCP runtime mode for downstream tool behavior (for example semantic rewrite LLM disablement).
+os.environ[RUNTIME_MODE_ENV] = RUNTIME_MODE_MCP
 
 # -------------------------------------------------------------------------
 # Workflow prompt (shared by MCP prompt and Cursor rule)
@@ -75,9 +89,23 @@ Use the opensearch-orchestrator MCP tools to guide the user from requirements to
 ## Workflow Phases
 
 ### Phase 1: Collect Sample Document (mandatory first step)
-- Call `load_sample(source_type, source_value)`.
+- If a sample is not already loaded, first ask the user to choose one source option:
+  1. Use built-in IMDB dataset
+  2. Load from a local file or URL
+  3. Load from a localhost OpenSearch index
+  4. Paste JSON directly
+- Call `load_sample(source_type, source_value, localhost_auth_mode, localhost_auth_username, localhost_auth_password)`.
   - source_type: "builtin_imdb" | "local_file" | "url" | "localhost_index" | "paste"
   - source_value: file path, URL, index name, or pasted JSON content (empty string for builtin_imdb)
+  - localhost auth args are used only for `source_type="localhost_index"`:
+    - localhost_auth_mode: "default" | "none" | "custom"
+      - "default": use localhost auth `admin` / `myStrongPassword123!`
+      - "none": force no authentication
+      - "custom": use provided username/password
+    - localhost_auth_username / localhost_auth_password: required only when mode is "custom"
+  - For localhost index flow, ask for index name first and call `load_sample` with `localhost_auth_mode="default"` unless the user explicitly requests `none` or `custom`.
+  - User-facing auth follow-ups must only offer "none" (no-auth) or "custom" (username/password). Never present "default" as a user-facing choice.
+  - If the user already provided both username and password, do not ask for credentials again.
 - The result includes `inferred_text_fields` and `text_search_required`.
 - A sample document is required before any planning or execution.
 
@@ -85,15 +113,19 @@ Use the opensearch-orchestrator MCP tools to guide the user from requirements to
 - Ask one preference question at a time, in this order:
   - **Budget**: flexible or cost-sensitive
   - **Performance priority**: speed-first, balanced, or accuracy-first
-  - **Query pattern**: mostly-exact (like "Carmencita 1894"), mostly-semantic
-    (like "early silent films about dancers"), or balanced (mix of both)
+  - If `text_search_required=true`, ask **Query pattern**: mostly-exact (like "Carmencita 1894"),
+    mostly-semantic (like "early silent films about dancers"), or balanced (mix of both).
 - Use the client user-input UI for each question (fixed options only, not free-text).
-- If query pattern is balanced or mostly-semantic, ask **Deployment preference** as a separate follow-up question:
+- If `text_search_required=true` and query pattern is balanced or mostly-semantic, ask
+  **Deployment preference** as a separate follow-up question:
   opensearch-node, sagemaker-endpoint, or external-embedding-api (also via user-input UI).
+- If `text_search_required=false`, do not ask query-pattern or deployment-preference questions.
+  Keep planning numeric/filter/aggregation-first and do not suggest changing or enriching data
+  solely to force semantic search unless the user explicitly asks for semantic search.
 - Call `set_preferences(budget, performance, query_pattern, deployment_preference)` with the collected values.
 
 ### Phase 3: Plan
-- Call `start_planning()` to get an initial architecture proposal from the planner agent.
+- Call `start_planning()` to get an initial architecture proposal from the client LLM planner.
 - If `start_planning()` returns `manual_planning_required=true`, use the client LLM to draft
   planner turns using the returned `manual_planner_system_prompt` and
   `manual_planner_initial_input`, then call `set_plan_from_planning_complete(...)`
@@ -104,20 +136,28 @@ Use the opensearch-orchestrator MCP tools to guide the user from requirements to
   This returns {solution, search_capabilities, keynote}.
 
 ### Phase 4: Execute
-- Call `execute_plan()` to create the index, models, pipelines, and launch the search UI.
-- If execution fails, the user can fix the issue (e.g., restart Docker) and you call `retry_execution()`.
+- Call `execute_plan()` to get manual worker bootstrap payload.
+- Run worker turns with the client LLM using:
+  - system message: `worker_system_prompt`
+  - first user message: `worker_initial_input`
+- Allow the client LLM to call execution tools (`create_index`, `create_and_attach_pipeline`,
+  `create_bedrock_embedding_model`, `create_local_pretrained_model`,
+  `apply_capability_driven_verification`, `launch_search_ui`, `set_search_ui_suggestions`) until done.
+- Commit the final worker response via `set_execution_from_execution_report(worker_response, execution_context)`.
+- If execution fails, the user can fix the issue (e.g., restart Docker) and call `retry_execution()` for a resume bootstrap payload.
 
 ### Post-Execution
-- After successful `execute_plan()`/`retry_execution()`, explicitly tell the user
-  how to access the UI using the `ui_access` URLs returned by the tool result.
-- `cleanup_verification()` removes test/verification documents when the user explicitly asks.
+- After successful `set_execution_from_execution_report(...)`, explicitly tell the user
+  how to access the UI using the returned `ui_access` URLs.
+- `cleanup()` removes test/verification documents when the user explicitly asks.
 
 ## Rules
 - Never skip Phase 1. A sample document is mandatory before planning.
 - Prefer planner tools for plan generation.
-- If manual planning is required (client sampling unavailable), generate the plan with the
+- If manual planning is required (`sampling/createMessage` unavailable), generate the plan with the
   client LLM using the provided planner prompt/input and persist it with
   `set_plan_from_planning_complete(...)` before execution.
+- Use `talk_to_client_llm(...)` as the general client-LLM bridge tool when direct sampling orchestration is needed.
 - Show the planner's proposal text to the user verbatim; do not summarize it away.
 - For preference questions, ask one question per turn and use user-input UI fixed options, not free-text.
 - Do not ask redundant clarification questions for items already inferred from the sample data.
@@ -141,7 +181,18 @@ mcp = FastMCP("OpenSearch Orchestrator", json_response=True)
 
 PLANNER_MODE_ENV = "OPENSEARCH_MCP_PLANNER_MODE"
 PLANNER_MODE_CLIENT = "client"
-PLANNER_MODE_SERVER = "server"
+ADVANCED_TOOLS_ENV = "OPENSEARCH_MCP_ENABLE_ADVANCED_TOOLS"
+_DEFAULT_LLM_CONVERSATION_ID = "default"
+_PLANNER_LLM_CONVERSATION_ID = "__planner__"
+_SEMANTIC_REWRITE_SYSTEM_PROMPT = (
+    "You rewrite document snippets into one concise semantic search query.\n"
+    "Rules:\n"
+    "- Output only one single-line query.\n"
+    "- Keep it natural and specific (about 4-12 words).\n"
+    "- Do not include URLs, domain fragments, or boilerplate words.\n"
+    "- Do not add explanations, labels, bullets, or quotes.\n"
+    "- Prefer core topic/entities and user intent."
+)
 _PLANNING_COMPLETE_PATTERN = re.compile(
     r"<planning_complete>(.*?)</planning_complete>",
     re.DOTALL | re.IGNORECASE,
@@ -152,18 +203,94 @@ _CAPABILITIES_PATTERN = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 _KEYNOTE_PATTERN = re.compile(r"<keynote>(.*?)</keynote>", re.DOTALL | re.IGNORECASE)
+_OPENSEARCH_AUTH_MODE_ENV = "OPENSEARCH_AUTH_MODE"
+_OPENSEARCH_USER_ENV = "OPENSEARCH_USER"
+_OPENSEARCH_PASSWORD_ENV = "OPENSEARCH_PASSWORD"
+_LOCALHOST_AUTH_MODE_DEFAULT = "default"
+_LOCALHOST_AUTH_MODE_NONE = "none"
+_LOCALHOST_AUTH_MODE_CUSTOM = "custom"
+_VALID_LOCALHOST_AUTH_MODES = {
+    _LOCALHOST_AUTH_MODE_DEFAULT,
+    _LOCALHOST_AUTH_MODE_NONE,
+    _LOCALHOST_AUTH_MODE_CUSTOM,
+}
 
 
 def _resolve_planner_mode() -> str:
     raw = str(os.getenv(PLANNER_MODE_ENV, PLANNER_MODE_CLIENT)).strip().lower()
-    if raw in {PLANNER_MODE_CLIENT, PLANNER_MODE_SERVER}:
+    if raw == PLANNER_MODE_CLIENT:
         return raw
     return PLANNER_MODE_CLIENT
+
+
+def _advanced_tools_enabled() -> bool:
+    raw = str(os.getenv(ADVANCED_TOOLS_ENV, "")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _is_method_not_found_error(exc: Exception) -> bool:
     message = str(exc or "").lower()
     return "method not found" in message
+
+
+def _resolve_execution_auth_override_from_state() -> tuple[str, str, str] | None:
+    """Return localhost auth override from engine state for localhost-index sessions."""
+    state = getattr(_engine, "state", None)
+    if state is None:
+        return None
+
+    source_index_name = str(getattr(state, "source_index_name", "") or "").strip()
+    if not source_index_name:
+        return None
+
+    mode = str(
+        getattr(state, "localhost_auth_mode", _LOCALHOST_AUTH_MODE_DEFAULT) or ""
+    ).strip().lower()
+    if mode not in _VALID_LOCALHOST_AUTH_MODES:
+        mode = _LOCALHOST_AUTH_MODE_DEFAULT
+
+    if mode == _LOCALHOST_AUTH_MODE_CUSTOM:
+        username = str(getattr(state, "localhost_auth_username", "") or "").strip()
+        password = str(getattr(state, "localhost_auth_password", "") or "").strip()
+        if not username or not password:
+            return None
+        return mode, username, password
+    return mode, "", ""
+
+
+@contextmanager
+def _temporary_execution_auth_env():
+    override = _resolve_execution_auth_override_from_state()
+    if override is None:
+        yield
+        return
+
+    mode, username, password = override
+    previous_mode = os.environ.get(_OPENSEARCH_AUTH_MODE_ENV)
+    previous_user = os.environ.get(_OPENSEARCH_USER_ENV)
+    previous_password = os.environ.get(_OPENSEARCH_PASSWORD_ENV)
+    try:
+        os.environ[_OPENSEARCH_AUTH_MODE_ENV] = mode
+        if mode == _LOCALHOST_AUTH_MODE_CUSTOM:
+            os.environ[_OPENSEARCH_USER_ENV] = username
+            os.environ[_OPENSEARCH_PASSWORD_ENV] = password
+        else:
+            os.environ.pop(_OPENSEARCH_USER_ENV, None)
+            os.environ.pop(_OPENSEARCH_PASSWORD_ENV, None)
+        yield
+    finally:
+        if previous_mode is None:
+            os.environ.pop(_OPENSEARCH_AUTH_MODE_ENV, None)
+        else:
+            os.environ[_OPENSEARCH_AUTH_MODE_ENV] = previous_mode
+        if previous_user is None:
+            os.environ.pop(_OPENSEARCH_USER_ENV, None)
+        else:
+            os.environ[_OPENSEARCH_USER_ENV] = previous_user
+        if previous_password is None:
+            os.environ.pop(_OPENSEARCH_PASSWORD_ENV, None)
+        else:
+            os.environ[_OPENSEARCH_PASSWORD_ENV] = previous_password
 
 
 def _build_current_planning_context(additional_context: str = "") -> str:
@@ -178,18 +305,18 @@ def _build_manual_planner_bootstrap(additional_context: str = "") -> dict[str, s
     """Build bootstrap prompts for manual client-LLM planning fallback.
 
     MCP client-mode usage flow:
-    1. Set `OPENSEARCH_MCP_PLANNER_MODE=client`.
-    2. Call `load_sample(...)`, then `set_preferences(...)`, then `start_planning()`.
-    3. If `start_planning()` returns `manual_planning_required=true`, run planner turns
+    1. Call `load_sample(...)` (include localhost auth args when source_type is localhost_index),
+       then `set_preferences(...)`, then `start_planning()`.
+    2. If `start_planning()` returns `manual_planning_required=true`, run planner turns
        in the client LLM using:
        - system message: `manual_planner_system_prompt`
        - first user message: `manual_planner_initial_input`
        - follow-up user feedback turns until the user confirms the plan
-    4. Commit the confirmed plan via
+    3. Commit the confirmed plan via
        `set_plan_from_planning_complete(planner_response)`, where
        `planner_response` includes:
        `<planning_complete><solution>...</solution><search_capabilities>...</search_capabilities><keynote>...</keynote></planning_complete>`
-    5. Continue with `execute_plan()` (and `retry_execution()` if needed).
+    4. Continue with `execute_plan()` (and `retry_execution()` if needed).
     """
     planning_context = _build_current_planning_context(additional_context)
     parser = PlanningSession(agent=lambda _prompt: "")
@@ -293,39 +420,98 @@ def _sampling_content_to_text(content: object) -> str:
     return str(content or "")
 
 
-class _ClientSamplingPlannerAgent:
-    """Planner callable that delegates generation to MCP client sampling."""
+class _ClientSamplingBridge:
+    """Reusable MCP client-LLM bridge keyed by conversation_id."""
 
-    def __init__(self, ctx: Context) -> None:
-        self._session = ctx.session
-        self._messages: list[mcp_types.SamplingMessage] = []
+    def __init__(self) -> None:
+        self._messages_by_conversation: dict[str, list[mcp_types.SamplingMessage]] = {}
 
-    def reset(self) -> None:
-        self._messages = []
+    def _resolve_conversation_id(self, conversation_id: str) -> str:
+        normalized = str(conversation_id or "").strip()
+        return normalized or _DEFAULT_LLM_CONVERSATION_ID
 
-    async def __call__(self, prompt: str) -> str:
-        prompt_text = str(prompt or "").strip()
+    def reset(self, conversation_id: str) -> str:
+        resolved = self._resolve_conversation_id(conversation_id)
+        self._messages_by_conversation.pop(resolved, None)
+        return resolved
+
+    async def send(
+        self,
+        *,
+        session: Any,
+        conversation_id: str,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int,
+        reset_conversation: bool = False,
+    ) -> dict[str, Any]:
+        resolved_conversation_id = self._resolve_conversation_id(conversation_id)
+        if reset_conversation:
+            self._messages_by_conversation.pop(resolved_conversation_id, None)
+
+        messages = self._messages_by_conversation.setdefault(
+            resolved_conversation_id,
+            [],
+        )
+        prompt_text = str(user_prompt or "").strip()
+        appended_user = False
         if prompt_text:
-            self._messages.append(
+            messages.append(
                 mcp_types.SamplingMessage(
                     role="user",
                     content=mcp_types.TextContent(type="text", text=prompt_text),
                 )
             )
+            appended_user = True
 
-        result = await self._session.create_message(
-            messages=self._messages,
-            max_tokens=4000,
-            system_prompt=PLANNER_SYSTEM_PROMPT,
-        )
+        try:
+            result = await session.create_message(
+                messages=messages,
+                max_tokens=max(1, int(max_tokens)),
+                system_prompt=str(system_prompt or ""),
+            )
+        except Exception:
+            if appended_user and messages:
+                messages.pop()
+            raise
+
         assistant_text = _sampling_content_to_text(result.content)
-        self._messages.append(
+        messages.append(
             mcp_types.SamplingMessage(
                 role="assistant",
                 content=mcp_types.TextContent(type="text", text=assistant_text),
             )
         )
-        return assistant_text
+        return {
+            "conversation_id": resolved_conversation_id,
+            "response": assistant_text,
+            "llm_backend": "client_sampling",
+        }
+
+
+_client_sampling_bridge = _ClientSamplingBridge()
+
+
+class _ClientSamplingPlannerAgent:
+    """Planner callable that delegates generation to MCP client sampling bridge."""
+
+    def __init__(self, ctx: Context) -> None:
+        self._session = ctx.session
+        self._conversation_id = _client_sampling_bridge.reset(_PLANNER_LLM_CONVERSATION_ID)
+
+    def reset(self) -> None:
+        _client_sampling_bridge.reset(self._conversation_id)
+
+    async def __call__(self, prompt: str) -> str:
+        result = await _client_sampling_bridge.send(
+            session=self._session,
+            conversation_id=self._conversation_id,
+            system_prompt=PLANNER_SYSTEM_PROMPT,
+            user_prompt=str(prompt or ""),
+            max_tokens=4000,
+            reset_conversation=False,
+        )
+        return str(result.get("response", ""))
 
 
 def _build_ui_access_payload() -> dict[str, object]:
@@ -341,8 +527,141 @@ def _build_ui_access_payload() -> dict[str, object]:
     }
 
 
+def _build_manual_llm_payload(
+    *,
+    conversation_id: str,
+    system_prompt: str,
+    user_prompt: str,
+    details: list[str] | None = None,
+    error: str = "Client sampling is unavailable.",
+) -> dict[str, object]:
+    return {
+        "error": error,
+        "conversation_id": str(conversation_id or _DEFAULT_LLM_CONVERSATION_ID),
+        "manual_llm_required": True,
+        "manual_system_prompt": str(system_prompt or ""),
+        "manual_user_prompt": str(user_prompt or ""),
+        "details": list(details or []),
+    }
+
+
+def _build_worker_bootstrap_payload(execution_context: str) -> dict[str, object]:
+    worker_context = str(execution_context or "").strip()
+    return {
+        "manual_execution_required": True,
+        "execution_backend": "client_manual",
+        "worker_system_prompt": WORKER_SYSTEM_PROMPT,
+        "worker_initial_input": build_worker_initial_input(worker_context),
+        "execution_context": worker_context,
+        "ui_access": _build_ui_access_payload(),
+    }
+
+
+def _extract_retry_context_details(retry_context: str) -> tuple[str, bool]:
+    text = str(retry_context or "").strip()
+    if not text:
+        return "", False
+    if text.startswith(_RESUME_WORKER_MARKER):
+        return text.split("\n", 1)[1].strip() if "\n" in text else "", True
+    return text, False
+
+
+def _build_retry_worker_bootstrap_payload(
+    retry_context: str,
+    *,
+    failed_step: str = "",
+    previous_steps: dict[str, str] | None = None,
+) -> dict[str, object]:
+    execution_context, is_resume = _extract_retry_context_details(retry_context)
+    return {
+        "manual_execution_required": True,
+        "execution_backend": "client_manual",
+        "is_retry": True,
+        "worker_system_prompt": WORKER_SYSTEM_PROMPT,
+        "worker_initial_input": build_worker_initial_input(
+            execution_context,
+            resume_mode=is_resume,
+            resume_step=str(failed_step or ""),
+            previous_steps=previous_steps or {},
+        ),
+        "execution_context": retry_context,
+        "ui_access": _build_ui_access_payload(),
+    }
+
+
+async def _rewrite_semantic_suggestion_entries_with_client_llm(
+    *,
+    result: dict[str, object],
+    ctx: Context | None,
+) -> dict[str, object]:
+    if not isinstance(result, dict):
+        return result
+    suggestion_meta = result.get("suggestion_meta", [])
+    if not isinstance(suggestion_meta, list) or not suggestion_meta:
+        return result
+    if ctx is None:
+        return result
+
+    rewritten_entries: list[dict[str, object]] = []
+    for entry in suggestion_meta:
+        if not isinstance(entry, dict):
+            rewritten_entries.append(entry)
+            continue
+        capability = str(entry.get("capability", "")).strip().lower()
+        text = str(entry.get("text", "")).strip()
+        if capability != "semantic" or not text:
+            rewritten_entries.append(dict(entry))
+            continue
+
+        try:
+            llm_result = await _client_sampling_bridge.send(
+                session=ctx.session,
+                conversation_id="semantic_rewrite",
+                system_prompt=_SEMANTIC_REWRITE_SYSTEM_PROMPT,
+                user_prompt=f"Rewrite this snippet into one semantic search query only:\n{text[:1800]}",
+                max_tokens=120,
+                reset_conversation=True,
+            )
+        except Exception as exc:
+            if _is_method_not_found_error(exc):
+                rewritten_entries.append(dict(entry))
+                continue
+            rewritten_entries.append(dict(entry))
+            continue
+
+        rewritten = str(llm_result.get("response", "")).strip()
+        if not rewritten:
+            rewritten_entries.append(dict(entry))
+            continue
+        rewritten = rewritten.splitlines()[0].strip()
+        rewritten = re.sub(r"^[-*]\s+", "", rewritten)
+        rewritten = re.sub(
+            r"^(?:semantic\s+query|query)\s*:\s*",
+            "",
+            rewritten,
+            flags=re.IGNORECASE,
+        )
+        rewritten = rewritten.strip().strip("`").strip("'").strip('"').strip()
+        if not rewritten:
+            rewritten_entries.append(dict(entry))
+            continue
+        item = dict(entry)
+        item["text"] = rewritten[:120]
+        rewritten_entries.append(item)
+
+    normalized = dict(result)
+    normalized["suggestion_meta"] = rewritten_entries
+    return normalized
+
+
 @mcp.tool()
-def load_sample(source_type: str, source_value: str = "") -> dict:
+def load_sample(
+    source_type: str,
+    source_value: str = "",
+    localhost_auth_mode: str = "default",
+    localhost_auth_username: str = "",
+    localhost_auth_password: str = "",
+) -> dict:
     """Load a sample document for OpenSearch solution design.
     This MUST be called first before any planning or execution.
 
@@ -351,12 +670,24 @@ def load_sample(source_type: str, source_value: str = "") -> dict:
                      "localhost_index", or "paste".
         source_value: File path, URL, index name, or pasted JSON content.
                       Use empty string for builtin_imdb.
+        localhost_auth_mode: "default", "none", or "custom" (localhost_index only).
+            - default: use localhost default credentials admin/myStrongPassword123!
+            - none: force no authentication
+            - custom: use localhost_auth_username/localhost_auth_password
+        localhost_auth_username: Username for localhost custom auth mode.
+        localhost_auth_password: Password for localhost custom auth mode.
 
     Returns:
         dict with sample_doc, inferred_text_fields, text_search_required,
         and status message.
     """
-    return _engine.load_sample(source_type=source_type, source_value=source_value)
+    return _engine.load_sample(
+        source_type=source_type,
+        source_value=source_value,
+        localhost_auth_mode=localhost_auth_mode,
+        localhost_auth_username=localhost_auth_username,
+        localhost_auth_password=localhost_auth_password,
+    )
 
 
 @mcp.tool()
@@ -389,6 +720,55 @@ def set_preferences(
 
 
 @mcp.tool()
+async def talk_to_client_llm(
+    system_prompt: str,
+    user_prompt: str,
+    conversation_id: str = _DEFAULT_LLM_CONVERSATION_ID,
+    reset_conversation: bool = False,
+    max_tokens: int = 4000,
+    ctx: Context | None = None,
+) -> dict:
+    """General-purpose client-LLM bridge over MCP sampling.
+
+    Returns `{"conversation_id","response","llm_backend":"client_sampling"}` on success.
+    Returns manual fallback payload when client sampling is unavailable.
+    """
+    resolved_conversation_id = str(conversation_id or _DEFAULT_LLM_CONVERSATION_ID).strip() or _DEFAULT_LLM_CONVERSATION_ID
+    if ctx is None:
+        return _build_manual_llm_payload(
+            conversation_id=resolved_conversation_id,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            details=["MCP context is unavailable for client sampling."],
+            error="Client LLM call failed.",
+        )
+
+    try:
+        return await _client_sampling_bridge.send(
+            session=ctx.session,
+            conversation_id=resolved_conversation_id,
+            system_prompt=str(system_prompt or ""),
+            user_prompt=str(user_prompt or ""),
+            max_tokens=max_tokens,
+            reset_conversation=bool(reset_conversation),
+        )
+    except Exception as exc:
+        if _is_method_not_found_error(exc):
+            return _build_manual_llm_payload(
+                conversation_id=resolved_conversation_id,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                details=[f"client-sampling LLM call failed: {exc}"],
+                error="Client LLM call failed.",
+            )
+        return {
+            "error": "Client LLM call failed.",
+            "conversation_id": resolved_conversation_id,
+            "details": [f"client-sampling LLM call failed: {exc}"],
+        }
+
+
+@mcp.tool()
 async def start_planning(additional_context: str = "", ctx: Context | None = None) -> dict:
     """Start the solution planning phase. Returns the planner's initial proposal.
     Call this after set_preferences.
@@ -399,66 +779,39 @@ async def start_planning(additional_context: str = "", ctx: Context | None = Non
     Returns:
         dict with response text, is_complete flag, and result (if complete).
     """
-    planner_mode = _resolve_planner_mode()
-    if planner_mode == PLANNER_MODE_CLIENT:
-        if ctx is None:
-            return {
-                "error": "Planning failed in client mode.",
-                "details": ["MCP context is unavailable for client sampling."],
-                "hint": (
-                    "Call start_planning via an MCP client session, "
-                    f"or set `{PLANNER_MODE_ENV}={PLANNER_MODE_SERVER}`."
-                ),
-            }
-        try:
-            result = await _engine.start_planning(
-                additional_context=additional_context,
-                planning_agent=_ClientSamplingPlannerAgent(ctx),
-            )
-            result["planner_backend"] = "client_sampling"
-            return result
-        except Exception as exc:
-            if _is_method_not_found_error(exc):
-                bootstrap = _build_manual_planner_bootstrap(additional_context)
-                return {
-                    "error": "Planning failed in client mode.",
-                    "details": [f"client-sampling planner failed: {exc}"],
-                    "planner_backend": "client_manual",
-                    "manual_planning_required": True,
-                    "hint": (
-                        "The MCP client does not support `sampling/createMessage`. "
-                        "Use the returned manual planner prompt/input to generate planner turns "
-                        "with the client LLM, then call `set_plan_from_planning_complete(...)` "
-                        "after user confirmation."
-                    ),
-                    **bootstrap,
-                }
+    if ctx is None:
+        return {
+            "error": "Planning failed in client mode.",
+            "details": ["MCP context is unavailable for client sampling."],
+            "hint": "Call start_planning via an MCP client session.",
+        }
+    try:
+        result = await _engine.start_planning(
+            additional_context=additional_context,
+            planning_agent=_ClientSamplingPlannerAgent(ctx),
+        )
+        result["planner_backend"] = "client_sampling"
+        return result
+    except Exception as exc:
+        if _is_method_not_found_error(exc):
+            bootstrap = _build_manual_planner_bootstrap(additional_context)
             return {
                 "error": "Planning failed in client mode.",
                 "details": [f"client-sampling planner failed: {exc}"],
-                "hint": f"Set `{PLANNER_MODE_ENV}={PLANNER_MODE_SERVER}` to use Bedrock planner.",
+                "planner_backend": "client_manual",
+                "manual_planning_required": True,
+                "hint": (
+                    "The MCP client does not support `sampling/createMessage`. "
+                    "Use the returned manual planner prompt/input to generate planner turns "
+                    "with the client LLM, then call `set_plan_from_planning_complete(...)` "
+                    "after user confirmation."
+                ),
+                **bootstrap,
             }
-
-    if planner_mode == PLANNER_MODE_SERVER:
-        try:
-            result = await _engine.start_planning(
-                additional_context=additional_context,
-            )
-            result["planner_backend"] = "server_bedrock"
-            return result
-        except Exception as exc:
-            return {
-                "error": "Planning failed in server mode.",
-                "details": [f"server planner failed: {exc}"],
-            }
-
-    return {
-        "error": "Failed to start planning.",
-        "details": [f"Unsupported planner mode: {planner_mode!r}"],
-        "hint": (
-            f"Set `{PLANNER_MODE_ENV}` to '{PLANNER_MODE_CLIENT}' or '{PLANNER_MODE_SERVER}'."
-        ),
-    }
+        return {
+            "error": "Planning failed in client mode.",
+            "details": [f"client-sampling planner failed: {exc}"],
+        }
 
 
 @mcp.tool()
@@ -486,7 +839,6 @@ async def finalize_plan() -> dict:
     return await _engine.finalize_plan()
 
 
-@mcp.tool()
 def set_plan(solution: str, search_capabilities: str = "", keynote: str = "") -> dict:
     """Store a client-authored finalized plan for execution after planner validation.
     Call this when the MCP client cannot run `start_planning` via client sampling
@@ -546,52 +898,201 @@ def set_plan_from_planning_complete(planner_response: str, additional_context: s
 
 @mcp.tool()
 async def execute_plan(additional_context: str = "") -> dict:
-    """Execute the finalized solution plan (create index, models, pipelines, UI).
+    """Build manual execution bootstrap for the finalized plan.
     Call after finalize_plan, set_plan, or set_plan_from_planning_complete.
 
     Args:
         additional_context: Optional extra instructions for the worker.
 
     Returns:
-        dict with worker execution report and UI access URLs.
+        dict with manual execution payload for client LLM worker turns.
     """
-    result = await _engine.execute_plan(
+    payload = _engine.build_execution_context(
         additional_context=additional_context,
     )
-    if "error" in result:
-        return result
-    return {
-        "execution_report": result["execution_report"],
-        "ui_access": _build_ui_access_payload(),
-    }
+    if "error" in payload:
+        return payload
+    execution_context = str(payload.get("execution_context", "")).strip()
+    if not execution_context:
+        return {"error": "Failed to build execution context for manual execution."}
+    return _build_worker_bootstrap_payload(execution_context)
 
 
 @mcp.tool()
 async def retry_execution() -> dict:
-    """Retry execution from the last failed step.
-    Call after execute_plan fails and the user has fixed the issue.
+    """Build manual retry bootstrap from the last failed step.
+    Call after execution fails and the user has fixed the issue.
 
     Returns:
-        dict with worker execution report and UI access URLs.
+        dict with manual retry payload for client LLM worker turns.
     """
-    result = await _engine.retry_execution()
-    if "error" in result:
-        return result
+    payload = _engine.build_retry_execution_context()
+    if "error" in payload:
+        return payload
+    retry_context = str(payload.get("execution_context", "")).strip()
+    if not retry_context:
+        return {"error": "No checkpoint context available. Run execute_plan first."}
+    return _build_retry_worker_bootstrap_payload(
+        retry_context,
+        failed_step=str(payload.get("failed_step", "")),
+        previous_steps=(
+            dict(payload.get("previous_steps", {}))
+            if isinstance(payload.get("previous_steps", {}), dict)
+            else {}
+        ),
+    )
+
+
+@mcp.tool()
+def set_execution_from_execution_report(
+    worker_response: str,
+    execution_context: str = "",
+) -> dict:
+    """Commit a client-authored worker response containing `<execution_report>`.
+
+    Args:
+        worker_response: Full worker response text with `<execution_report>` block.
+        execution_context: Context returned by execute_plan()/retry_execution().
+
+    Returns:
+        dict with normalized execution_report, ui_access, and status.
+    """
+    committed = commit_execution_report(
+        worker_response,
+        execution_context=execution_context,
+    )
+    if "error" in committed:
+        return committed
+
+    report = committed.get("execution_report", {})
+    status = str(report.get("status", "")).strip().lower() if isinstance(report, dict) else ""
+    _engine.phase = Phase.DONE if status == "success" else Phase.EXEC_FAILED
     return {
-        "execution_report": result["execution_report"],
+        "status": str(committed.get("status", "Execution report stored.")),
+        "execution_report": report,
+        "execution_context": str(committed.get("execution_context", "")),
         "ui_access": _build_ui_access_payload(),
     }
 
 
 @mcp.tool()
-def cleanup_verification() -> str:
+def create_index(
+    index_name: str,
+    body: dict | None = None,
+    replace_if_exists: bool = True,
+    sample_doc_json: str = "",
+    source_local_file: str = "",
+    source_index_name: str = "",
+) -> str:
+    """Create an OpenSearch index for MCP manual execution mode."""
+    with _temporary_execution_auth_env():
+        return create_index_impl(
+            index_name=index_name,
+            body=body,
+            replace_if_exists=replace_if_exists,
+            sample_doc_json=sample_doc_json,
+            source_local_file=source_local_file,
+            source_index_name=source_index_name,
+        )
+
+
+@mcp.tool()
+def create_and_attach_pipeline(
+    pipeline_name: str,
+    pipeline_body: dict,
+    index_name: str,
+    pipeline_type: str = "ingest",
+    replace_if_exists: bool = True,
+    is_hybrid_search: bool = False,
+    hybrid_weights: list[float] | None = None,
+) -> str:
+    """Create and attach ingest/search pipelines for MCP manual execution mode."""
+    with _temporary_execution_auth_env():
+        return create_and_attach_pipeline_impl(
+            pipeline_name=pipeline_name,
+            pipeline_body=pipeline_body,
+            index_name=index_name,
+            pipeline_type=pipeline_type,
+            replace_if_exists=replace_if_exists,
+            is_hybrid_search=is_hybrid_search,
+            hybrid_weights=hybrid_weights,
+        )
+
+
+@mcp.tool()
+def create_bedrock_embedding_model(model_name: str) -> str:
+    """Create a Bedrock embedding model."""
+    with _temporary_execution_auth_env():
+        return create_bedrock_embedding_model_impl(model_name=model_name)
+
+
+@mcp.tool()
+def create_local_pretrained_model(model_name: str) -> str:
+    """Create a local OpenSearch-hosted pretrained model."""
+    with _temporary_execution_auth_env():
+        return create_local_pretrained_model_impl(model_name=model_name)
+
+
+@mcp.tool()
+async def apply_capability_driven_verification(
+    worker_output: str,
+    index_name: str = "",
+    count: int = 10,
+    id_prefix: str = "verification",
+    sample_doc_json: str = "",
+    source_local_file: str = "",
+    source_index_name: str = "",
+    existing_verification_doc_ids: str = "",
+    ctx: Context | None = None,
+) -> dict[str, object]:
+    """Apply capability-driven verification and MCP semantic-query rewrite via client LLM."""
+    with _temporary_execution_auth_env():
+        result = apply_capability_driven_verification_impl(
+            worker_output=worker_output,
+            index_name=index_name,
+            count=count,
+            id_prefix=id_prefix,
+            sample_doc_json=sample_doc_json,
+            source_local_file=source_local_file,
+            source_index_name=source_index_name,
+            existing_verification_doc_ids=existing_verification_doc_ids,
+        )
+    return await _rewrite_semantic_suggestion_entries_with_client_llm(result=result, ctx=ctx)
+
+
+@mcp.tool()
+def launch_search_ui(index_name: str = "") -> str:
+    """Launch Search Builder UI."""
+    with _temporary_execution_auth_env():
+        return launch_search_ui_impl(index_name=index_name)
+
+
+@mcp.tool()
+def set_search_ui_suggestions(index_name: str, suggestion_meta_json: str) -> str:
+    """Store search suggestion metadata for UI bootstrap."""
+    return set_search_ui_suggestions_impl(
+        index_name=index_name,
+        suggestion_meta_json=suggestion_meta_json,
+    )
+
+
+@mcp.tool()
+def cleanup() -> str:
     """Remove verification/test documents from the OpenSearch index.
     Call only when the user explicitly asks for cleanup.
 
     Returns:
         str: Cleanup result message.
     """
-    return cleanup_verification_docs()
+    with _temporary_execution_auth_env():
+        return cleanup_docs_impl()
+
+
+# Expose minimal knowledge tools by default for MCP manual planning/execution flows.
+mcp.tool()(read_knowledge_base)
+mcp.tool()(read_dense_vector_models)
+mcp.tool()(read_sparse_vector_models)
+mcp.tool()(search_opensearch_org)
 
 
 # -------------------------------------------------------------------------
@@ -612,27 +1113,20 @@ def opensearch_workflow() -> str:
 # Low-level domain tools (kept for advanced / direct-access clients)
 # -------------------------------------------------------------------------
 
-mcp.tool()(submit_sample_doc)
-mcp.tool()(submit_sample_doc_from_local_file)
-mcp.tool()(submit_sample_doc_from_url)
-mcp.tool()(get_sample_docs_for_verification)
-mcp.tool()(read_knowledge_base)
-mcp.tool()(read_dense_vector_models)
-mcp.tool()(read_sparse_vector_models)
-mcp.tool()(search_opensearch_org)
+if _advanced_tools_enabled():
+    # Legacy manual planning commit path kept for advanced/direct-access clients.
+    mcp.tool()(set_plan)
 
-mcp.tool()(create_index)
-mcp.tool()(create_and_attach_pipeline)
-mcp.tool()(create_bedrock_embedding_model)
-mcp.tool()(create_local_pretrained_model)
-mcp.tool()(index_doc)
-mcp.tool()(index_verification_docs)
-mcp.tool()(delete_doc)
-mcp.tool()(apply_capability_driven_verification)
-mcp.tool()(preview_cap_driven_verification)
-mcp.tool()(launch_search_ui)
-mcp.tool()(cleanup_ui_server)
-mcp.tool()(set_search_ui_suggestions)
+    # Raw ingestion/index helpers are advanced-only.
+    mcp.tool()(submit_sample_doc)
+    mcp.tool()(submit_sample_doc_from_local_file)
+    mcp.tool()(submit_sample_doc_from_url)
+    mcp.tool()(get_sample_docs_for_verification)
+    mcp.tool()(index_doc_impl)
+    mcp.tool()(index_verification_docs_impl)
+    mcp.tool()(delete_doc_impl)
+    mcp.tool()(preview_cap_driven_verification_impl)
+    mcp.tool()(cleanup_ui_server_impl)
 
 
 def _flatten_exception_leaves(exc: BaseException) -> list[BaseException]:

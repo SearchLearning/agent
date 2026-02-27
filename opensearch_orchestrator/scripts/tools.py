@@ -339,22 +339,50 @@ def _format_index_options(index_counts: list[tuple[str, int]], limit: int = 20) 
     return "\n".join(lines)
 
 
+_OPENSEARCH_AUTH_MODE_ENV = "OPENSEARCH_AUTH_MODE"
+_OPENSEARCH_AUTH_MODE_DEFAULT = "default"
+_OPENSEARCH_AUTH_MODE_NONE = "none"
+_OPENSEARCH_AUTH_MODE_CUSTOM = "custom"
+_OPENSEARCH_USER_ENV = "OPENSEARCH_USER"
+_OPENSEARCH_PASSWORD_ENV = "OPENSEARCH_PASSWORD"
+_OPENSEARCH_DEFAULT_USER = "admin"
+_OPENSEARCH_DEFAULT_PASSWORD = "myStrongPassword123!"
+
+
+def _resolve_localhost_http_auth_from_env() -> tuple[tuple[str, str] | None, str | None]:
+    mode = str(os.getenv(_OPENSEARCH_AUTH_MODE_ENV, _OPENSEARCH_AUTH_MODE_DEFAULT) or "").strip().lower()
+    if mode == _OPENSEARCH_AUTH_MODE_NONE:
+        return None, None
+    if mode == _OPENSEARCH_AUTH_MODE_CUSTOM:
+        user = str(os.getenv(_OPENSEARCH_USER_ENV, "") or "").strip()
+        password = str(os.getenv(_OPENSEARCH_PASSWORD_ENV, "") or "").strip()
+        if not user or not password:
+            return None, (
+                "Error: OPENSEARCH_AUTH_MODE=custom requires OPENSEARCH_USER and OPENSEARCH_PASSWORD."
+            )
+        return (user, password), None
+    return (_OPENSEARCH_DEFAULT_USER, _OPENSEARCH_DEFAULT_PASSWORD), None
+
+
 def _create_local_opensearch_client():
     from opensearchpy import OpenSearch
 
     host = os.getenv("OPENSEARCH_HOST", "localhost")
     port = int(os.getenv("OPENSEARCH_PORT", "9200"))
-    user = os.getenv("OPENSEARCH_USER", "admin")
-    password = os.getenv("OPENSEARCH_PASSWORD", "myStrongPassword123!")
+    http_auth, auth_error = _resolve_localhost_http_auth_from_env()
+    if auth_error:
+        return None, auth_error
 
     def _build(use_ssl: bool) -> OpenSearch:
-        return OpenSearch(
-            hosts=[{"host": host, "port": port}],
-            use_ssl=use_ssl,
-            verify_certs=False,
-            ssl_show_warn=False,
-            http_auth=(user, password),
-        )
+        kwargs = {
+            "hosts": [{"host": host, "port": port}],
+            "use_ssl": use_ssl,
+            "verify_certs": False,
+            "ssl_show_warn": False,
+        }
+        if http_auth is not None:
+            kwargs["http_auth"] = http_auth
+        return OpenSearch(**kwargs)
 
     errors: list[str] = []
     for use_ssl in (True, False):

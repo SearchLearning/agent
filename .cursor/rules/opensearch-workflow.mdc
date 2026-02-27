@@ -10,19 +10,35 @@ You have access to the `opensearch-orchestrator` MCP server.
 Follow these phases in order using its tools:
 
 ### Phase 1: Collect Sample Document
-- Call `load_sample(source_type, source_value)` first.
+- Ask the user to choose one source option as a numbered list:
+  1. Use built-in IMDB dataset
+  2. Load from a local file or URL
+  3. Load from a localhost OpenSearch index
+  4. Paste JSON directly
+- Call `load_sample(source_type, source_value, localhost_auth_mode, localhost_auth_username, localhost_auth_password)` first.
   - source_type: "builtin_imdb" | "local_file" | "url" | "localhost_index" | "paste"
   - source_value: path, URL, index name, or JSON content (empty string for builtin_imdb)
+  - localhost auth args are used only when `source_type="localhost_index"`:
+    - `localhost_auth_mode`: "default" | "none" | "custom"
+      - `default` => use `admin` / `myStrongPassword123!` (internal fallback; not a user-facing choice)
+      - `none` => force no authentication
+      - `custom` => force provided username/password
+    - `localhost_auth_username` and `localhost_auth_password`: required only for "custom"
+  - For localhost index flow, ask for index name first and call `load_sample(..., localhost_auth_mode="default", ...)` unless the user explicitly requests `none` or `custom`.
+  - User-facing auth questions must only offer: "none" (no-auth) or "custom" (username/password). Never show `default` as a user-facing auth option.
+  - If the user already provided both username and password, do not ask for credentials again.
 - The result includes `inferred_text_fields` and `text_search_required`.
 
 ### Phase 2: Gather Preferences
 - Ask one preference question at a time, in this order:
   - budget (flexible / cost-sensitive)
   - performance priority (speed-first / balanced / accuracy-first)
-  - query pattern (`mostly-exact` like "Carmencita 1894" / `mostly-semantic` like "early silent films about dancers" / `balanced` mix of both)
+  - if `text_search_required=true`: query pattern (`mostly-exact` like "Carmencita 1894" / `mostly-semantic` like "early silent films about dancers" / `balanced` mix of both)
 - Use the client user-input UI for each question (fixed options only, no free-text).
-- If query pattern is balanced or mostly-semantic, ask deployment preference as a separate follow-up question
+- If `text_search_required=true` and query pattern is balanced or mostly-semantic, ask deployment preference as a separate follow-up question
   (opensearch-node / sagemaker-endpoint / external-embedding-api), also via user-input UI.
+- If `text_search_required=false`, skip query-pattern/deployment questions and stay numeric/filter/aggregation-first.
+  Do not suggest changing or enriching data solely to force semantic search unless explicitly requested.
 - Call `set_preferences(budget, performance, query_pattern, deployment_preference)`.
 
 ### Phase 3: Plan
@@ -43,7 +59,7 @@ Follow these phases in order using its tools:
 ### Post-Execution
 - After successful `execute_plan()`/`retry_execution()`, explicitly tell the user
   how to access the UI using the `ui_access` URLs returned by the tool result.
-- `cleanup_verification()` removes test documents when the user explicitly asks.
+- `cleanup()` removes test documents when the user explicitly asks.
 
 ### Rules
 - Never skip Phase 1. A sample document is mandatory before planning.

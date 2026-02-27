@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 import sys
 
@@ -141,3 +142,107 @@ def test_engine_accepts_client_authored_plan_for_execution() -> None:
     execution = asyncio.run(engine.execute_plan(worker_executor=_fake_worker))
     assert "execution_report" in execution
     assert "Client-authored plan" in captured["context"]
+
+
+def test_engine_persists_localhost_auth_state_into_execution(monkeypatch) -> None:
+    state = orchestrator.SessionState()
+    engine = orchestrator.create_transport_agnostic_engine(state)
+
+    monkeypatch.setattr(
+        orchestrator,
+        "submit_sample_doc_from_localhost_index",
+        lambda _source_value: json.dumps(
+            {
+                "status": "Sample document loaded from localhost OpenSearch index 'yellow-tripdata'.",
+                "sample_doc": {"VendorID": "1", "fare_amount": "14.5"},
+                "source_index_name": "yellow-tripdata",
+                "source_localhost_index": True,
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    load_result = engine.load_sample(
+        source_type="localhost_index",
+        source_value="yellow-tripdata",
+        localhost_auth_mode="custom",
+        localhost_auth_username="alice",
+        localhost_auth_password="secret",
+    )
+
+    assert "error" not in load_result
+    assert state.localhost_auth_mode == "custom"
+    assert state.localhost_auth_username == "alice"
+    assert state.localhost_auth_password == "secret"
+
+    stored = engine.set_plan(
+        solution="- Retrieval Method: BM25",
+        search_capabilities="- Exact: term match",
+        keynote="localhost auth persistence check",
+    )
+    assert stored["status"] == "Plan stored."
+
+    captured: dict[str, str] = {}
+
+    def _fake_worker(worker_state: orchestrator.SessionState, context: str) -> str:
+        captured["mode"] = worker_state.localhost_auth_mode
+        captured["username"] = str(worker_state.localhost_auth_username or "")
+        captured["password"] = str(worker_state.localhost_auth_password or "")
+        captured["context"] = context
+        return "<execution_report>{\"status\":\"success\"}</execution_report>"
+
+    execution = asyncio.run(engine.execute_plan(worker_executor=_fake_worker))
+    assert "execution_report" in execution
+    assert captured["mode"] == "custom"
+    assert captured["username"] == "alice"
+    assert captured["password"] == "secret"
+
+
+def test_engine_set_preferences_treats_semantic_as_not_applicable_for_non_text_sample(
+    monkeypatch,
+) -> None:
+    state = orchestrator.SessionState()
+    engine = orchestrator.create_transport_agnostic_engine(state)
+
+    monkeypatch.setattr(
+        orchestrator,
+        "submit_sample_doc_from_localhost_index",
+        lambda _source_value: json.dumps(
+            {
+                "status": "Sample document loaded from localhost OpenSearch index 'yellow-tripdata'.",
+                "sample_doc": {
+                    "VendorID": 2,
+                    "tpep_pickup_datetime": "2024-12-01T00:12:27",
+                    "trip_distance": 9.76,
+                    "PULocationID": 138,
+                },
+                "source_index_name": "yellow-tripdata",
+                "source_localhost_index": True,
+                "source_index_doc_count": 10000,
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    load_result = engine.load_sample(
+        source_type="localhost_index",
+        source_value="yellow-tripdata",
+    )
+
+    assert "error" not in load_result
+    assert load_result["text_search_required"] is False
+    assert load_result["inferred_text_fields"] == []
+
+    preferences = engine.set_preferences(
+        budget="cost-sensitive",
+        performance="speed-first",
+        query_pattern="balanced",
+        deployment_preference="sagemaker-endpoint",
+    )
+
+    assert preferences["hybrid_weight_profile"] is None
+    assert preferences["deployment_preference"] is None
+    context_notes = str(preferences["context_notes"])
+    assert "Requirements note: semantic query-pattern preference =" not in context_notes
+    assert "Hybrid Weight Profile:" not in context_notes
+    assert "Requirements note: production model deployment preference =" not in context_notes

@@ -25,6 +25,7 @@ def test_start_planning_returns_manual_fallback_on_method_not_found(monkeypatch)
     assert result["planner_backend"] == "client_manual"
     assert result["manual_planning_required"] is True
     assert "sampling/createMessage" in result["hint"]
+    assert "bedrock" not in result["hint"].lower()
     assert result["manual_planner_system_prompt"]
     assert result["manual_planner_initial_input"]
 

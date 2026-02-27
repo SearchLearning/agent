@@ -22,8 +22,14 @@ from opensearch_orchestrator.scripts.tools import get_sample_docs_payload, norma
 
 OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "localhost")
 OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", "9200"))
-OPENSEARCH_USER = os.getenv("OPENSEARCH_USER", "admin")
-OPENSEARCH_PASSWORD = os.getenv("OPENSEARCH_PASSWORD", "myStrongPassword123!")
+OPENSEARCH_AUTH_MODE_ENV = "OPENSEARCH_AUTH_MODE"
+OPENSEARCH_AUTH_MODE_DEFAULT = "default"
+OPENSEARCH_AUTH_MODE_NONE = "none"
+OPENSEARCH_AUTH_MODE_CUSTOM = "custom"
+OPENSEARCH_USER_ENV = "OPENSEARCH_USER"
+OPENSEARCH_PASSWORD_ENV = "OPENSEARCH_PASSWORD"
+OPENSEARCH_DEFAULT_USER = "admin"
+OPENSEARCH_DEFAULT_PASSWORD = "myStrongPassword123!"
 OPENSEARCH_DOCKER_IMAGE = os.getenv("OPENSEARCH_DOCKER_IMAGE", "opensearchproject/opensearch:latest")
 OPENSEARCH_DOCKER_CONTAINER = os.getenv("OPENSEARCH_DOCKER_CONTAINER", "opensearch-local")
 OPENSEARCH_DOCKER_START_TIMEOUT = int(os.getenv("OPENSEARCH_DOCKER_START_TIMEOUT", "120"))
@@ -47,9 +53,20 @@ _MODEL_MEMORY_SIGNAL_TOKENS = (
     "circuit_breaking_exception",
     "ml_commons.native_memory_threshold",
 )
+_AUTH_FAILURE_TOKENS = (
+    "401",
+    "403",
+    "unauthorized",
+    "forbidden",
+    "authentication",
+    "security_exception",
+    "missing authentication credentials",
+)
 SEMANTIC_QUERY_REWRITE_FLAG = "SEMANTIC_QUERY_REWRITE_USE_LLM"
 SEMANTIC_QUERY_REWRITE_MODEL_ID_ENV = "SEMANTIC_QUERY_REWRITE_MODEL_ID"
 DEFAULT_SEMANTIC_QUERY_REWRITE_MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+RUNTIME_MODE_ENV = "OPENSEARCH_RUNTIME_MODE"
+RUNTIME_MODE_MCP = "mcp"
 
 _SEARCH_UI_CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -575,22 +592,41 @@ def _load_sample_docs_with_note(
     return [], "; ".join(diagnostics)
 
 
-def _build_client(use_ssl: bool) -> OpenSearch:
-    return OpenSearch(
-        hosts=[{"host": OPENSEARCH_HOST, "port": OPENSEARCH_PORT}],
-        use_ssl=use_ssl,
-        verify_certs=False,
-        ssl_show_warn=False,
-        http_auth=(OPENSEARCH_USER, OPENSEARCH_PASSWORD),
-    )
+def _resolve_http_auth_from_env() -> tuple[str, str] | None:
+    mode = str(os.getenv(OPENSEARCH_AUTH_MODE_ENV, OPENSEARCH_AUTH_MODE_DEFAULT) or "").strip().lower()
+    if mode == OPENSEARCH_AUTH_MODE_NONE:
+        return None
+    if mode == OPENSEARCH_AUTH_MODE_CUSTOM:
+        user = str(os.getenv(OPENSEARCH_USER_ENV, "") or "").strip()
+        password = str(os.getenv(OPENSEARCH_PASSWORD_ENV, "") or "").strip()
+        if not user or not password:
+            raise RuntimeError(
+                "OPENSEARCH_AUTH_MODE=custom requires OPENSEARCH_USER and OPENSEARCH_PASSWORD."
+            )
+        return user, password
+    return OPENSEARCH_DEFAULT_USER, OPENSEARCH_DEFAULT_PASSWORD
 
 
-def _can_connect(opensearch_client: OpenSearch) -> bool:
+def _build_client(use_ssl: bool, http_auth: tuple[str, str] | None = None) -> OpenSearch:
+    kwargs = {
+        "hosts": [{"host": OPENSEARCH_HOST, "port": OPENSEARCH_PORT}],
+        "use_ssl": use_ssl,
+        "verify_certs": False,
+        "ssl_show_warn": False,
+    }
+    if http_auth is not None:
+        kwargs["http_auth"] = http_auth
+    return OpenSearch(**kwargs)
+
+
+def _can_connect(opensearch_client: OpenSearch) -> tuple[bool, bool]:
     try:
         opensearch_client.info()
-        return True
-    except Exception:
-        return False
+        return True, False
+    except Exception as e:
+        lowered = normalize_text(e).lower()
+        auth_failure = any(token in lowered for token in _AUTH_FAILURE_TOKENS)
+        return False, auth_failure
 
 
 def _is_local_host(host: str) -> bool:
@@ -663,6 +699,33 @@ def _format_model_failure_message(stage: str, error: object) -> str:
     return message
 
 
+def _run_new_local_opensearch_container() -> None:
+    """Pull and run a new local OpenSearch container."""
+    _run_docker_command(["docker", "pull", OPENSEARCH_DOCKER_IMAGE])
+    _run_docker_command(
+        [
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            OPENSEARCH_DOCKER_CONTAINER,
+            "-p",
+            f"{OPENSEARCH_PORT}:9200",
+            "-p",
+            "9600:9600",
+            "-e",
+            "discovery.type=single-node",
+            "-e",
+            "plugins.security.disabled=true",
+            "-e",
+            "DISABLE_INSTALL_DEMO_CONFIG=true",
+            "-e",
+            "OPENSEARCH_JAVA_OPTS=-Xms4g -Xmx4g",
+            OPENSEARCH_DOCKER_IMAGE,
+        ]
+    )
+
+
 def _start_local_opensearch_container() -> None:
     if not _is_local_host(OPENSEARCH_HOST):
         raise RuntimeError(
@@ -693,43 +756,84 @@ def _start_local_opensearch_container() -> None:
         ["docker", "ps", "-aq", "-f", f"name=^{OPENSEARCH_DOCKER_CONTAINER}$"]
     ).stdout.strip()
     if existing:
-        _run_docker_command(["docker", "rm", "-f", OPENSEARCH_DOCKER_CONTAINER])
+        _run_docker_command(["docker", "start", OPENSEARCH_DOCKER_CONTAINER])
+        return
 
-    # Pull official OpenSearch Docker image and run a single-node instance.
-    _run_docker_command(["docker", "pull", OPENSEARCH_DOCKER_IMAGE])
-    _run_docker_command(
-        [
-            "docker",
-            "run",
-            "-d",
-            "--name",
-            OPENSEARCH_DOCKER_CONTAINER,
-            "-p",
-            f"{OPENSEARCH_PORT}:9200",
-            "-p",
-            "9600:9600",
-            "-e",
-            "discovery.type=single-node",
-            "-e",
-            "plugins.security.disabled=true",
-            "-e",
-            "DISABLE_INSTALL_DEMO_CONFIG=true",
-            "-e",
-            "OPENSEARCH_JAVA_OPTS=-Xms4g -Xmx4g",
-            OPENSEARCH_DOCKER_IMAGE,
-        ]
-    )
+    _run_new_local_opensearch_container()
+
+
+def recover_local_opensearch_container() -> tuple[bool, str]:
+    """Recover local OpenSearch runtime state for exception-driven retry flows.
+
+    Returns:
+        tuple[bool, str]:
+            - bool: True when the cluster is reachable after recovery checks/actions.
+            - str: Actionable diagnostics describing the action taken or failure reason.
+    """
+    if not _is_local_host(OPENSEARCH_HOST):
+        return (
+            False,
+            f"Skip recovery: OPENSEARCH_HOST '{OPENSEARCH_HOST}' is not local.",
+        )
+
+    try:
+        _run_docker_command(["docker", "--version"])
+    except Exception:
+        return (
+            False,
+            "Recovery failed: Docker is not installed or not available in PATH. "
+            f"{_docker_install_hint()}",
+        )
+
+    try:
+        running = _run_docker_command(
+            ["docker", "ps", "-q", "-f", f"name=^{OPENSEARCH_DOCKER_CONTAINER}$"]
+        ).stdout.strip()
+        existing = _run_docker_command(
+            ["docker", "ps", "-aq", "-f", f"name=^{OPENSEARCH_DOCKER_CONTAINER}$"]
+        ).stdout.strip()
+    except Exception:
+        return (
+            False,
+            "Recovery failed: Docker daemon is not reachable. "
+            f"{_docker_start_hint()}",
+        )
+
+    action = "verified existing running container"
+    try:
+        if running:
+            action = "verified existing running container"
+        elif existing:
+            _run_docker_command(["docker", "start", OPENSEARCH_DOCKER_CONTAINER])
+            action = "started existing stopped container"
+        else:
+            _run_new_local_opensearch_container()
+            action = "created and started new container"
+
+        _wait_for_cluster_after_start()
+        return (
+            True,
+            f"Recovery succeeded: {action} '{OPENSEARCH_DOCKER_CONTAINER}' and cluster is reachable.",
+        )
+    except Exception as e:
+        return (
+            False,
+            f"Recovery failed after '{action}': {e}",
+        )
 
 
 def _wait_for_cluster_after_start() -> OpenSearch:
-    secure_client = _build_client(use_ssl=True)
-    insecure_client = _build_client(use_ssl=False)
+    http_auth = _resolve_http_auth_from_env()
+    secure_client = _build_client(use_ssl=True, http_auth=http_auth)
+    insecure_client = _build_client(use_ssl=False, http_auth=http_auth)
     deadline = time.time() + OPENSEARCH_DOCKER_START_TIMEOUT
 
     while time.time() < deadline:
-        if _can_connect(secure_client):
+        secure_ok, _ = _can_connect(secure_client)
+        if secure_ok:
             return secure_client
-        if _can_connect(insecure_client):
+        insecure_ok, _ = _can_connect(insecure_client)
+        if insecure_ok:
             return insecure_client
         time.sleep(2)
 
@@ -739,17 +843,25 @@ def _wait_for_cluster_after_start() -> OpenSearch:
 
 
 def _create_client() -> OpenSearch:
-    # First try secured localhost access (equivalent to:
-    # curl https://localhost:9200 -u admin:myStrongPassword123! --insecure).
-    secure_client = _build_client(use_ssl=True)
-    if _can_connect(secure_client):
+    http_auth = _resolve_http_auth_from_env()
+
+    secure_client = _build_client(use_ssl=True, http_auth=http_auth)
+    secure_ok, secure_auth_failure = _can_connect(secure_client)
+    if secure_ok:
         return secure_client
 
-    insecure_client = _build_client(use_ssl=False)
-    if _can_connect(insecure_client):
+    insecure_client = _build_client(use_ssl=False, http_auth=http_auth)
+    insecure_ok, insecure_auth_failure = _can_connect(insecure_client)
+    if insecure_ok:
         return insecure_client
 
-    # Both direct connection attempts failed, so bootstrap local OpenSearch with Docker.
+    if secure_auth_failure or insecure_auth_failure:
+        raise RuntimeError(
+            "Authentication failed while connecting to OpenSearch at "
+            f"{OPENSEARCH_HOST}:{OPENSEARCH_PORT}."
+        )
+
+    # Direct connection attempts failed without auth errors, so bootstrap local OpenSearch with Docker.
     _start_local_opensearch_container()
     return _wait_for_cluster_after_start()
 
@@ -1544,9 +1656,18 @@ def _extract_doc_features(
 
     if not semantic_candidates:
         for item in scalar_items:
+            field_type = str(item.get("type", "")).strip().lower()
+            if field_type not in {"text", "keyword", "constant_keyword"}:
+                continue
             shape = item["shape"]
             text_value = str(shape["text"])
-            if len(text_value) >= 4 and not _looks_like_url_noise(text_value):
+            if (
+                len(text_value) >= 4
+                and float(shape.get("alpha_ratio", 0.0)) >= 0.35
+                and not bool(shape.get("looks_numeric", False))
+                and not bool(shape.get("looks_date", False))
+                and not _looks_like_url_noise(text_value)
+            ):
                 semantic_candidates.append(
                     {
                         "text": text_value,
@@ -1959,6 +2080,9 @@ def _is_truthy_flag(raw_value: str) -> bool:
 
 
 def _semantic_query_rewrite_llm_enabled() -> bool:
+    runtime_mode = str(os.getenv(RUNTIME_MODE_ENV, "")).strip().lower()
+    if runtime_mode == RUNTIME_MODE_MCP:
+        return False
     explicit = os.getenv(SEMANTIC_QUERY_REWRITE_FLAG, "").strip()
     if explicit:
         return _is_truthy_flag(explicit)
@@ -5037,7 +5161,7 @@ def index_verification_docs(
         "indexed_count": len(indexed_ids),
         "doc_ids": indexed_ids,
         "errors": errors,
-        "cleanup_hint": "Verification docs were kept. Run cleanup_verification_docs when user asks.",
+        "cleanup_hint": "Verification docs were kept. Run cleanup_docs when user asks.",
     }
     return json.dumps(result, ensure_ascii=False)
 
@@ -5172,7 +5296,7 @@ def delete_doc(index_name: str, doc_id: str) -> str:
 
 
 
-def cleanup_verification_docs(index_name: str = "", doc_ids: str = "") -> str:
+def cleanup_docs(index_name: str = "", doc_ids: str = "") -> str:
     """Delete verification docs from an index.
 
     Args:

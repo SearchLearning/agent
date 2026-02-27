@@ -113,6 +113,15 @@ def test_rewrite_semantic_example_prefers_llm_when_enabled(monkeypatch):
     assert rewritten == "academy award winners history"
 
 
+def test_semantic_query_rewrite_llm_disabled_in_mcp_runtime(monkeypatch):
+    monkeypatch.setenv(tools.RUNTIME_MODE_ENV, tools.RUNTIME_MODE_MCP)
+    monkeypatch.delenv(tools.SEMANTIC_QUERY_REWRITE_FLAG, raising=False)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "dummy")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "dummy")
+
+    assert tools._semantic_query_rewrite_llm_enabled() is False
+
+
 def test_rewrite_semantic_example_url_noise_fallback_without_llm(monkeypatch):
     monkeypatch.delenv(tools.SEMANTIC_QUERY_REWRITE_FLAG, raising=False)
 
@@ -310,6 +319,25 @@ def test_build_suggestion_entry_skips_autocomplete_and_fuzzy_for_date_numeric_on
     assert tools._build_suggestion_entry({"id": "fuzzy", "examples": []}, features) is None
 
 
+def test_extract_doc_features_numeric_date_schema_has_no_semantic_candidates():
+    source = {
+        "VendorID": 2,
+        "tpep_pickup_datetime": "2024-12-01T00:12:27",
+        "trip_distance": 9.76,
+        "PULocationID": 138,
+    }
+    field_specs = {
+        "VendorID": {"type": "integer", "normalizer": ""},
+        "tpep_pickup_datetime": {"type": "date", "normalizer": ""},
+        "trip_distance": {"type": "float", "normalizer": ""},
+        "PULocationID": {"type": "integer", "normalizer": ""},
+    }
+
+    features = tools._extract_doc_features(source, field_specs)
+
+    assert features["semantic_candidates"] == []
+
+
 def test_apply_verification_skips_unsupported_capabilities_for_numeric_date_schema(monkeypatch):
     tools._search_ui.suggestion_meta_by_index.clear()
 
@@ -364,6 +392,55 @@ def test_apply_verification_skips_unsupported_capabilities_for_numeric_date_sche
     notes = " ".join(result.get("notes", [])).lower()
     assert "no compatible sample document found" not in notes
 
+    suggestion_meta = result.get("suggestion_meta", [])
+    assert [entry.get("capability") for entry in suggestion_meta] == ["structured"]
+
+
+def test_apply_verification_skips_semantic_for_numeric_date_schema(monkeypatch):
+    tools._search_ui.suggestion_meta_by_index.clear()
+
+    mapping_response = {
+        "nyc_taxi": {
+            "mappings": {
+                "properties": {
+                    "VendorID": {"type": "integer"},
+                    "tpep_pickup_datetime": {"type": "date"},
+                    "trip_distance": {"type": "float"},
+                    "PULocationID": {"type": "integer"},
+                }
+            }
+        }
+    }
+    fake_client = _FakeClient(mapping_response=mapping_response)
+    monkeypatch.setattr(tools, "_create_client", lambda: fake_client)
+    monkeypatch.setattr(
+        tools,
+        "get_sample_docs_payload",
+        lambda limit=200, sample_doc_json="", source_local_file="": [
+            {
+                "VendorID": 2,
+                "tpep_pickup_datetime": "2024-12-01T00:12:27",
+                "trip_distance": 9.76,
+                "PULocationID": 138,
+            }
+        ],
+    )
+
+    worker_output = (
+        "## Search Capabilities\n"
+        "- Semantic: concept search\n"
+        "- Structured: numeric/date filters\n"
+    )
+    result = tools.apply_capability_driven_verification(
+        worker_output=worker_output,
+        index_name="nyc_taxi",
+        count=1,
+    )
+
+    assert result["applied"] is True
+    assert result.get("applicable_capabilities") == ["structured"]
+    skipped = result.get("skipped_capabilities", [])
+    assert [item.get("id") for item in skipped] == ["semantic"]
     suggestion_meta = result.get("suggestion_meta", [])
     assert [entry.get("capability") for entry in suggestion_meta] == ["structured"]
 

@@ -58,23 +58,34 @@ The server exposes high-level phase tools that mirror the standalone orchestrato
 
 | Tool | Phase | Description |
 |------|-------|-------------|
-| `load_sample` | 1 | Load a sample document (built-in, file, URL, index, or paste) |
+| `load_sample` | 1 | Load a sample document (built-in, file, URL, index, or paste); localhost-index mode supports explicit auth mode/credentials |
 | `set_preferences` | 2 | Set budget, performance, query pattern, deployment preferences |
 | `start_planning` | 3 | Start the planning agent; returns initial architecture proposal |
 | `refine_plan` | 3 | Send user feedback to refine the proposal |
 | `finalize_plan` | 3 | Finalize the plan when the user confirms |
-| `set_plan` | 3 | Store a client-authored finalized plan (validated manual fallback) |
+| `talk_to_client_llm` | 3/4 | General MCP client-sampling bridge for client LLM turns |
 | `set_plan_from_planning_complete` | 3 | Parse/store a `<planning_complete>` planner response |
-| `execute_plan` | 4 | Execute the plan (create index, models, pipelines, UI) |
-| `retry_execution` | 4 | Resume from a failed execution step |
-| `cleanup_verification` | Post | Remove test documents on user request |
+| `execute_plan` | 4 | Return manual worker bootstrap payload (no server-side Bedrock execution in MCP) |
+| `set_execution_from_execution_report` | 4 | Parse/store normalized `<execution_report>` and update retry state |
+| `retry_execution` | 4 | Return resume bootstrap payload from last failed step |
+| `cleanup` | Post | Remove test documents on user request |
 
-Low-level domain tools (`create_index`, `submit_sample_doc`, etc.) are also exposed for advanced use.
+The following execution/knowledge tools are exposed by default for manual client-driven execution:
+`create_index`, `create_and_attach_pipeline`, `create_bedrock_embedding_model`,
+`create_local_pretrained_model`, `apply_capability_driven_verification`,
+`launch_search_ui`, `set_search_ui_suggestions`, `read_knowledge_base`,
+`read_dense_vector_models`, `read_sparse_vector_models`, `search_opensearch_org`.
+
+Advanced tools (`set_plan`, raw sample-submit variants, indexing helpers, etc.) are hidden by default and only exposed when `OPENSEARCH_MCP_ENABLE_ADVANCED_TOOLS=true`.
+
+Localhost index auth contract (Option 3 / `source_type="localhost_index"`):
+- `localhost_auth_mode="default"`: force `admin` / `myStrongPassword123!`
+- `localhost_auth_mode="none"`: force no authentication
+- `localhost_auth_mode="custom"`: require `localhost_auth_username` + `localhost_auth_password`
 
 Planner backend in MCP mode:
-- Default: `OPENSEARCH_MCP_PLANNER_MODE=client` (uses MCP client sampling / client LLM).
-- Server mode: `OPENSEARCH_MCP_PLANNER_MODE=server` (uses server-side Bedrock planner).
-- Client fallback: if the MCP client does not support `sampling/createMessage`,
+- MCP planning uses client sampling / client LLM only (no Bedrock fallback in MCP mode).
+- Manual fallback: if the MCP client does not support `sampling/createMessage`,
   `start_planning` returns `manual_planning_required=true` plus
   `manual_planner_system_prompt` and `manual_planner_initial_input`; run planner turns
   with the client LLM and call `set_plan_from_planning_complete(planner_response)`.

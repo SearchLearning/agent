@@ -1,6 +1,8 @@
 import asyncio
 import json
+import os
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from strands import Agent, tool
@@ -41,7 +43,7 @@ from opensearch_orchestrator.scripts.shared import (
     clear_last_worker_run_state,
     get_last_worker_run_state,
 )
-from opensearch_orchestrator.scripts.opensearch_ops_tools import cleanup_verification_docs
+from opensearch_orchestrator.scripts.opensearch_ops_tools import cleanup_docs
 from opensearch_orchestrator.solution_planning_assistant import solution_planning_assistant, reset_planner_agent
 from opensearch_orchestrator.planning_session import PlanningSession
 from opensearch_orchestrator.orchestrator_engine import OrchestratorEngine
@@ -76,6 +78,13 @@ Your goal is to guide the user from initial requirements to a finalized, execute
     *       Supported formats: __SUPPORTED_SAMPLE_FILE_FORMATS_MARKDOWN__
     *       Example: `/path/to/your/data.json` or `https://example.com/sample.json`
     *   `3` Existing localhost OpenSearch index
+    *       Authentication defaults to `admin` / `myStrongPassword123!`.
+    *       Ask for index name first and assume default auth unless user explicitly asks for no-auth or custom credentials.
+    *       Do NOT ask the user to choose `default` auth mode.
+    *       If auth follow-up is needed, only offer: no-auth (`none`) or custom credentials (`custom`).
+    *       If user has no credentials, use no-auth mode.
+    *       If user provides credentials explicitly, use that username/password.
+    *       If user already provided both username and password, do NOT ask for credentials again.
     *       If option 3 is selected without a valid index name, list current
         non-system localhost indices and ask the user to select one.
     *   `4` Paste sample content directly (preferably JSON records)
@@ -185,6 +194,17 @@ MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
 _RESUME_WORKER_MARKER = "[RESUME_WORKER_FROM_FAILED_STEP]"
 _SYSTEM_SOURCE_CONTEXT_HEADER = "[SYSTEM SOURCE CONTEXT]"
+_OPENSEARCH_AUTH_MODE_ENV = "OPENSEARCH_AUTH_MODE"
+_OPENSEARCH_USER_ENV = "OPENSEARCH_USER"
+_OPENSEARCH_PASSWORD_ENV = "OPENSEARCH_PASSWORD"
+_LOCALHOST_AUTH_MODE_DEFAULT = "default"
+_LOCALHOST_AUTH_MODE_NONE = "none"
+_LOCALHOST_AUTH_MODE_CUSTOM = "custom"
+_VALID_LOCALHOST_AUTH_MODES = {
+    _LOCALHOST_AUTH_MODE_DEFAULT,
+    _LOCALHOST_AUTH_MODE_NONE,
+    _LOCALHOST_AUTH_MODE_CUSTOM,
+}
 
 
 @dataclass
@@ -201,6 +221,9 @@ class SessionState:
     prefix_wildcard_enabled: bool | None = None
     hybrid_weight_profile: str | None = None
     pending_localhost_index_options: list[str] = field(default_factory=list)
+    localhost_auth_mode: str = _LOCALHOST_AUTH_MODE_DEFAULT
+    localhost_auth_username: str | None = None
+    localhost_auth_password: str | None = None
 
 _NUMERIC_STRING_PATTERN = re.compile(r"[+-]?\d+(\.\d+)?")
 _DATEISH_STRING_PATTERN = re.compile(
@@ -229,7 +252,7 @@ _DEFAULT_QUERY_FEATURES_NOTE = (
 )
 _MODEL_DEPLOYMENT_SCOPE_NOTE = (
     "Requirements note: production model deployment options include OpenSearch node, SageMaker endpoint, "
-    "and external embedding APIs. If query-pattern preference is balanced or mostly-semantic, "
+    "and external embedding APIs. If text-based search is in scope and query-pattern preference is balanced or mostly-semantic, "
     "capture/reflect the preferred production deployment mode. "
     "Execution policy: Launch UI setup provisions local OpenSearch-hosted pretrained models only "
     "(dense or sparse) for bootstrap."
@@ -706,6 +729,138 @@ def _resolve_pending_localhost_index_selection(
     return None
 
 
+def _normalize_localhost_auth_mode(mode: str | None) -> str:
+    normalized = str(mode or "").strip().lower()
+    if normalized in _VALID_LOCALHOST_AUTH_MODES:
+        return normalized
+    return _LOCALHOST_AUTH_MODE_DEFAULT
+
+
+def _set_localhost_auth_state(
+    state: SessionState,
+    mode: str,
+    username: str = "",
+    password: str = "",
+) -> None:
+    normalized_mode = _normalize_localhost_auth_mode(mode)
+    state.localhost_auth_mode = normalized_mode
+    if normalized_mode == _LOCALHOST_AUTH_MODE_CUSTOM:
+        state.localhost_auth_username = str(username or "").strip() or None
+        state.localhost_auth_password = str(password or "").strip() or None
+    else:
+        state.localhost_auth_username = None
+        state.localhost_auth_password = None
+
+
+def _resolve_localhost_auth_from_state(state: SessionState) -> tuple[str, str, str]:
+    mode = _normalize_localhost_auth_mode(state.localhost_auth_mode)
+    if mode == _LOCALHOST_AUTH_MODE_CUSTOM:
+        username = str(state.localhost_auth_username or "").strip()
+        password = str(state.localhost_auth_password or "").strip()
+        return mode, username, password
+    return mode, "", ""
+
+
+@contextmanager
+def _temporary_localhost_auth_env(
+    mode: str,
+    username: str = "",
+    password: str = "",
+):
+    previous_mode = os.environ.get(_OPENSEARCH_AUTH_MODE_ENV)
+    previous_user = os.environ.get(_OPENSEARCH_USER_ENV)
+    previous_password = os.environ.get(_OPENSEARCH_PASSWORD_ENV)
+    try:
+        normalized_mode = _normalize_localhost_auth_mode(mode)
+        os.environ[_OPENSEARCH_AUTH_MODE_ENV] = normalized_mode
+        if normalized_mode == _LOCALHOST_AUTH_MODE_CUSTOM:
+            os.environ[_OPENSEARCH_USER_ENV] = str(username or "")
+            os.environ[_OPENSEARCH_PASSWORD_ENV] = str(password or "")
+        else:
+            os.environ.pop(_OPENSEARCH_USER_ENV, None)
+            os.environ.pop(_OPENSEARCH_PASSWORD_ENV, None)
+        yield
+    finally:
+        if previous_mode is None:
+            os.environ.pop(_OPENSEARCH_AUTH_MODE_ENV, None)
+        else:
+            os.environ[_OPENSEARCH_AUTH_MODE_ENV] = previous_mode
+        if previous_user is None:
+            os.environ.pop(_OPENSEARCH_USER_ENV, None)
+        else:
+            os.environ[_OPENSEARCH_USER_ENV] = previous_user
+        if previous_password is None:
+            os.environ.pop(_OPENSEARCH_PASSWORD_ENV, None)
+        else:
+            os.environ[_OPENSEARCH_PASSWORD_ENV] = previous_password
+
+
+def _looks_like_no_credentials_phrase(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if not lowered:
+        return False
+    patterns = (
+        r"\b(?:no|without)\s+(?:credentials|username|password)\b",
+        r"\b(?:do not|don't|dont)\s+have\b[^.\n]{0,50}\b(?:credentials|username|password)\b",
+    )
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def _extract_localhost_auth_override_from_text(
+    text: str,
+) -> tuple[str | None, str, str, str | None]:
+    raw_text = str(text or "")
+    if not raw_text.strip():
+        return None, "", "", None
+
+    kv_matches = re.finditer(
+        r"""(?ix)\b(username|user|password|pass|auth|no_auth)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s,;]+))""",
+        raw_text,
+    )
+    kv: dict[str, str] = {}
+    for match in kv_matches:
+        key = str(match.group(1) or "").strip().lower()
+        value = str(match.group(2) or match.group(3) or match.group(4) or "").strip()
+        if key and value:
+            kv[key] = value
+
+    username = str(kv.get("username") or kv.get("user") or "").strip()
+    password = str(kv.get("password") or kv.get("pass") or "").strip()
+
+    if username or password:
+        if not username or not password:
+            return (
+                None,
+                "",
+                "",
+                "Error: custom localhost auth requires both username and password (for example: username=alice password=secret).",
+            )
+        return _LOCALHOST_AUTH_MODE_CUSTOM, username, password, None
+
+    explicit_auth_mode = str(kv.get("auth", "")).strip().lower()
+    if explicit_auth_mode == _LOCALHOST_AUTH_MODE_NONE:
+        return _LOCALHOST_AUTH_MODE_NONE, "", "", None
+
+    explicit_no_auth = str(kv.get("no_auth", "")).strip().lower()
+    if explicit_no_auth in {"1", "true", "yes", "y", "on"}:
+        return _LOCALHOST_AUTH_MODE_NONE, "", "", None
+
+    if _looks_like_no_credentials_phrase(raw_text):
+        return _LOCALHOST_AUTH_MODE_NONE, "", "", None
+
+    return None, "", "", None
+
+
+def _redact_localhost_auth_secrets(text: str) -> str:
+    redacted = str(text or "")
+    redacted = re.sub(
+        r"""(?ix)\b(password|pass)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)""",
+        lambda match: f"{match.group(1)}=***",
+        redacted,
+    )
+    return redacted
+
+
 def _looks_like_pasted_sample_content(user_input: str) -> bool:
     """Detect pasted JSON sample content for option 4 style input."""
     raw = str(user_input or "").strip()
@@ -858,6 +1013,7 @@ def _reset_session_state(state: SessionState) -> None:
     state.model_deployment_preference = None
     state.prefix_wildcard_enabled = None
     state.hybrid_weight_profile = None
+    _set_localhost_auth_state(state, _LOCALHOST_AUTH_MODE_DEFAULT)
 
 
 def _orchestrator_submit_sample_doc(state: SessionState, doc: str) -> str:
@@ -935,7 +1091,13 @@ def _augment_worker_context_with_source(state: SessionState, context: str) -> st
 
 
 def _run_worker_agent_with_state(state: SessionState, context: str) -> str:
-    return worker_agent_impl(_augment_worker_context_with_source(state, context))
+    worker_context = _augment_worker_context_with_source(state, context)
+    if not state.source_index_name:
+        return worker_agent_impl(worker_context)
+
+    mode, username, password = _resolve_localhost_auth_from_state(state)
+    with _temporary_localhost_auth_env(mode=mode, username=username, password=password):
+        return worker_agent_impl(worker_context)
 
 
 # -------------------------------------------------------------------------
@@ -987,7 +1149,7 @@ def _iter_context_note_entries(state: SessionState) -> list[tuple[str, str]]:
                 _build_performance_preference_note(state.performance_priority),
             )
         )
-    if state.hybrid_weight_profile:
+    if state.inferred_text_search_required and state.hybrid_weight_profile:
         entries.append(
             (
                 _SEMANTIC_QUERY_PATTERN_PREFERENCE_NOTE_PREFIX,
@@ -1007,7 +1169,7 @@ def _iter_context_note_entries(state: SessionState) -> list[tuple[str, str]]:
                 _build_prefix_wildcard_requirement_note(state.prefix_wildcard_enabled),
             )
         )
-    if state.model_deployment_preference:
+    if state.inferred_text_search_required and state.model_deployment_preference:
         entries.append(
             (
                 _MODEL_DEPLOYMENT_PREFERENCE_NOTE_PREFIX,
@@ -1075,6 +1237,19 @@ def create_transport_agnostic_engine(
     """Create shared orchestration engine used by CLI and MCP adapters."""
     effective_state = state or SessionState()
 
+    def _load_localhost_index_sample_with_auth(
+        source_value: str = "",
+        localhost_auth_mode: str = _LOCALHOST_AUTH_MODE_DEFAULT,
+        localhost_auth_username: str = "",
+        localhost_auth_password: str = "",
+    ) -> str:
+        with _temporary_localhost_auth_env(
+            mode=localhost_auth_mode,
+            username=localhost_auth_username,
+            password=localhost_auth_password,
+        ):
+            return submit_sample_doc_from_localhost_index(source_value)
+
     return OrchestratorEngine(
         state=effective_state,
         clear_sample_state=_clear_orchestrator_sample_state,
@@ -1090,7 +1265,7 @@ def create_transport_agnostic_engine(
         load_builtin_sample=lambda: submit_sample_doc_from_local_file(BUILTIN_IMDB_SAMPLE_PATH),
         load_local_file_sample=submit_sample_doc_from_local_file,
         load_url_sample=submit_sample_doc_from_url,
-        load_localhost_index_sample=submit_sample_doc_from_localhost_index,
+        load_localhost_index_sample=_load_localhost_index_sample_with_auth,
         load_pasted_sample=submit_sample_doc,
         budget_option_flexible=_BUDGET_OPTION_FLEXIBLE,
         budget_option_cost_sensitive=_BUDGET_OPTION_COST_SENSITIVE,
@@ -1200,11 +1375,13 @@ async def main():
 
             # Preserve the raw user message for source detection and final prompt handoff.
             raw_user_input = user_input
+            safe_user_input = _redact_localhost_auth_secrets(raw_user_input)
+            user_input = safe_user_input
 
             # ── Intent routing (hard-coded, before LLM) ────────────
 
             if phase in (Phase.DONE, Phase.EXEC_FAILED) and looks_like_cleanup_request(user_input):
-                cleanup_result = cleanup_verification_docs()
+                cleanup_result = cleanup_docs()
                 print(f"Orchestrator: {cleanup_result}\n")
                 continue
 
@@ -1267,15 +1444,41 @@ async def main():
                         source_detection_input,
                         state.pending_localhost_index_options,
                     )
+                    localhost_detection = bool(
+                        pending_selected_index
+                        or looks_like_localhost_index_message(source_detection_input)
+                        or option_3_selected
+                    )
+                    if localhost_detection:
+                        auth_mode, auth_username, auth_password, auth_error = (
+                            _extract_localhost_auth_override_from_text(source_detection_input)
+                        )
+                        if auth_error:
+                            load_payload = {"error": auth_error}
+                            source_label = "localhost OpenSearch index"
+                        elif auth_mode:
+                            _set_localhost_auth_state(
+                                state,
+                                mode=auth_mode,
+                                username=auth_username,
+                                password=auth_password,
+                            )
 
-                    if pending_selected_index:
+                    effective_auth_mode, effective_auth_username, effective_auth_password = (
+                        _resolve_localhost_auth_from_state(state)
+                    )
+
+                    if load_payload is None and pending_selected_index:
                         load_payload = engine.load_sample(
                             source_type="localhost_index",
                             source_value=pending_selected_index,
+                            localhost_auth_mode=effective_auth_mode,
+                            localhost_auth_username=effective_auth_username,
+                            localhost_auth_password=effective_auth_password,
                         )
                         source_label = "localhost OpenSearch index"
                         state.pending_localhost_index_options = []
-                    elif (
+                    elif load_payload is None and (
                         looks_like_localhost_index_message(source_detection_input)
                         or option_3_selected
                     ):
@@ -1283,40 +1486,43 @@ async def main():
                         load_payload = engine.load_sample(
                             source_type="localhost_index",
                             source_value=index_hint,
+                            localhost_auth_mode=effective_auth_mode,
+                            localhost_auth_username=effective_auth_username,
+                            localhost_auth_password=effective_auth_password,
                         )
                         source_label = "localhost OpenSearch index"
-                    elif _looks_like_pasted_sample_content(source_detection_input):
+                    elif load_payload is None and _looks_like_pasted_sample_content(source_detection_input):
                         state.pending_localhost_index_options = []
                         load_payload = engine.load_sample(
                             source_type="paste",
                             source_value=source_detection_input,
                         )
                         source_label = "pasted sample content"
-                    elif (
+                    elif load_payload is None and (
                         looks_like_builtin_imdb_sample_request(source_detection_input)
                         or normalized_input in {"1", "option 1", "choice 1"}
                     ):
                         state.pending_localhost_index_options = []
                         load_payload = engine.load_sample(source_type="builtin_imdb")
                         source_label = f"built-in IMDb sample file ({BUILTIN_IMDB_SAMPLE_PATH})"
-                    elif looks_like_url_message(source_detection_input):
+                    elif load_payload is None and looks_like_url_message(source_detection_input):
                         state.pending_localhost_index_options = []
                         load_payload = engine.load_sample(
                             source_type="url",
                             source_value=source_detection_input,
                         )
                         source_label = "URL"
-                    elif looks_like_local_path_message(source_detection_input):
+                    elif load_payload is None and looks_like_local_path_message(source_detection_input):
                         state.pending_localhost_index_options = []
                         load_payload = engine.load_sample(
                             source_type="local_file",
                             source_value=source_detection_input,
                         )
                         source_label = "local file/folder path"
-                    elif option_4_selected:
+                    elif load_payload is None and option_4_selected:
                         state.pending_localhost_index_options = []
                         user_input = (
-                            f"{raw_user_input}\n\n"
+                            f"{safe_user_input}\n\n"
                             "System instruction: The user selected option 4 (paste sample content). "
                             "Ask the user to paste 1-3 representative JSON records now. "
                             "Provide this example format:\n"
@@ -1324,7 +1530,7 @@ async def main():
                             '{"id":"2","title":"Example B","description":"Sample text B","category":"demo"}\n'
                             "then call submit_sample_doc with that content."
                         )
-                    elif normalized_input in {"2", "option 2", "choice 2"}:
+                    elif load_payload is None and normalized_input in {"2", "option 2", "choice 2"}:
                         state.pending_localhost_index_options = []
                         load_payload = {
                             "error": (
@@ -1371,7 +1577,7 @@ async def main():
                             "ACTION REQUIRED: Proceed to Phase 2 (requirements gathering). "
                             "DO NOT ask the user to paste sample content.\n\n"
                             "[USER MESSAGE]\n"
-                            f"{raw_user_input}"
+                            f"{safe_user_input}"
                         )
                     elif isinstance(load_payload, dict) and str(load_payload.get("error", "")).startswith("Error:"):
                         load_error = str(load_payload.get("error", ""))
@@ -1393,7 +1599,7 @@ async def main():
                         if localhost_empty_index_error:
                             state.pending_localhost_index_options = []
                             user_input = (
-                                f"{raw_user_input}\n\n"
+                                f"{safe_user_input}\n\n"
                                 "System note: Automatic sample loading from localhost OpenSearch index failed.\n"
                                 f"Failure reason: {load_error}\n"
                                 "System instruction: The user already provided the index name. "
@@ -1410,7 +1616,7 @@ async def main():
                                 _extract_localhost_index_options_from_error(load_error)
                             )
                             user_input = (
-                                f"{raw_user_input}\n\n"
+                                f"{safe_user_input}\n\n"
                                 "System note: Automatic sample loading from localhost OpenSearch index failed.\n"
                                 f"Failure reason: {load_error}\n"
                                 "System instruction: Briefly tell the user this exact failure reason. "
@@ -1424,7 +1630,7 @@ async def main():
                         else:
                             state.pending_localhost_index_options = []
                             user_input = (
-                                f"{raw_user_input}\n\n"
+                                f"{safe_user_input}\n\n"
                                 f"System note: Automatic sample loading from {source} failed.\n"
                                 f"Failure reason: {load_error}\n"
                                 "System instruction: Briefly tell the user this exact failure reason, "

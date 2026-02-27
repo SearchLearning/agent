@@ -108,3 +108,17 @@ def test_requires_model_deployment_preference_false_for_lexical():
     assert not orchestrator._requires_model_deployment_preference(
         orchestrator._HYBRID_WEIGHT_OPTION_LEXICAL
     )
+
+
+def test_build_context_notes_skips_semantic_and_deployment_notes_when_text_not_required():
+    state = orchestrator.SessionState(
+        inferred_text_search_required=False,
+        hybrid_weight_profile=orchestrator._HYBRID_WEIGHT_OPTION_BALANCED,
+        model_deployment_preference=orchestrator._MODEL_DEPLOYMENT_OPTION_SAGEMAKER_ENDPOINT,
+    )
+
+    notes = orchestrator._build_context_notes(state)
+
+    assert "Requirements note: semantic query-pattern preference =" not in notes
+    assert "Hybrid Weight Profile:" not in notes
+    assert "Requirements note: production model deployment preference =" not in notes

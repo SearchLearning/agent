@@ -7,6 +7,11 @@
         "opensearch_orchestrator/mcp_server.py"
       ],
       "cwd": "/Users/kaituo/code/poc/agent-poc",
+      "env": {
+        "OPENSEARCH_AUTH_MODE": "custom",
+        "OPENSEARCH_USER": "admin",
+        "OPENSEARCH_PASSWORD": "myStrongPassword1234!"
+      },
       "disabled": false,
       "autoApprove": [
         "load_sample",
@@ -19,7 +24,15 @@
         "read_knowledge_base",
         "read_dense_vector_models",
         "read_sparse_vector_models",
-        "set_plan_from_planning_complete"
+        "set_plan_from_planning_complete",
+        "create_index",
+        "apply_capability_driven_verification",
+        "set_search_ui_suggestions",
+        "launch_search_ui",
+        "set_execution_from_execution_report",
+        "create_local_pretrained_model",
+        "create_local_pretrained_model",
+        "create_and_attach_pipeline"
       ]
     }
   }

@@ -122,3 +122,46 @@ def test_augment_worker_context_with_source_preserves_resume_marker():
 
     assert augmented.startswith(orchestrator._RESUME_WORKER_MARKER)
     assert orchestrator._SYSTEM_SOURCE_CONTEXT_HEADER in augmented
+
+
+def test_extract_localhost_auth_override_custom_credentials():
+    mode, username, password, error = orchestrator._extract_localhost_auth_override_from_text(
+        "use option 3 with username=alice password='s3cr3t'"
+    )
+
+    assert error is None
+    assert mode == orchestrator._LOCALHOST_AUTH_MODE_CUSTOM
+    assert username == "alice"
+    assert password == "s3cr3t"
+
+
+def test_extract_localhost_auth_override_none_from_phrase():
+    mode, username, password, error = orchestrator._extract_localhost_auth_override_from_text(
+        "Use localhost index, I don't have username and password."
+    )
+
+    assert error is None
+    assert mode == orchestrator._LOCALHOST_AUTH_MODE_NONE
+    assert username == ""
+    assert password == ""
+
+
+def test_extract_localhost_auth_override_rejects_incomplete_custom_credentials():
+    mode, username, password, error = orchestrator._extract_localhost_auth_override_from_text(
+        "use localhost index username=alice"
+    )
+
+    assert mode is None
+    assert username == ""
+    assert password == ""
+    assert error is not None
+    assert "requires both username and password" in error.lower()
+
+
+def test_redact_localhost_auth_secrets_masks_password_tokens():
+    text = "option 3 username=alice password=mySecret123!"
+
+    redacted = orchestrator._redact_localhost_auth_secrets(text)
+
+    assert "mySecret123!" not in redacted
+    assert "password=***" in redacted
