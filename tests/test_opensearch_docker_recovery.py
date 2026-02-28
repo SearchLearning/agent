@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import sys
 import subprocess
 
@@ -11,6 +12,88 @@ import opensearch_orchestrator.scripts.opensearch_ops_tools as tools
 
 def _cp(stdout: str = "") -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
+
+
+def test_run_docker_command_uses_resolved_absolute_cli_path(monkeypatch):
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(tools, "_resolve_docker_executable", lambda: "/usr/local/bin/docker")
+
+    def _run(command: list[str], check: bool, capture_output: bool, text: bool):
+        captured["command"] = command
+        captured["check"] = check
+        captured["capture_output"] = capture_output
+        captured["text"] = text
+        return _cp("ok")
+
+    monkeypatch.setattr(tools.subprocess, "run", _run)
+
+    result = tools._run_docker_command(["docker", "--version"])
+
+    assert result.stdout == "ok"
+    assert captured["command"] == ["/usr/local/bin/docker", "--version"]
+    assert captured["check"] is True
+    assert captured["capture_output"] is True
+    assert captured["text"] is True
+
+
+def test_resolve_docker_executable_uses_windows_default_path(monkeypatch):
+    expected = os.path.join(
+        r"C:\Program Files",
+        "Docker",
+        "Docker",
+        "resources",
+        "bin",
+        "docker.exe",
+    )
+
+    monkeypatch.setattr(tools.platform, "system", lambda: "Windows")
+    monkeypatch.delenv("OPENSEARCH_DOCKER_CLI_PATH", raising=False)
+    monkeypatch.setenv("ProgramFiles", r"C:\Program Files")
+    monkeypatch.setenv("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setattr(tools.shutil, "which", lambda _: None)
+
+    original_isfile = tools.os.path.isfile
+    monkeypatch.setattr(
+        tools.os.path,
+        "isfile",
+        lambda path: path == expected or original_isfile(path),
+    )
+
+    assert tools._resolve_docker_executable() == expected
+
+
+def test_new_container_bootstrap_sets_default_admin_password(monkeypatch):
+    calls: list[list[str]] = []
+
+    def _run(command: list[str]):
+        calls.append(command)
+        return _cp("ok")
+
+    monkeypatch.delenv("OPENSEARCH_PASSWORD", raising=False)
+    monkeypatch.setattr(tools, "_run_docker_command", _run)
+
+    tools._run_new_local_opensearch_container()
+
+    run_command = next(cmd for cmd in calls if cmd[:2] == ["docker", "run"])
+    assert "OPENSEARCH_INITIAL_ADMIN_PASSWORD=myStrongPassword123!" in run_command
+
+
+def test_new_container_bootstrap_uses_env_password(monkeypatch):
+    calls: list[list[str]] = []
+
+    def _run(command: list[str]):
+        calls.append(command)
+        return _cp("ok")
+
+    monkeypatch.setenv("OPENSEARCH_PASSWORD", "AdminPass!234")
+    monkeypatch.setattr(tools, "_run_docker_command", _run)
+
+    tools._run_new_local_opensearch_container()
+
+    run_command = next(cmd for cmd in calls if cmd[:2] == ["docker", "run"])
+    assert "OPENSEARCH_INITIAL_ADMIN_PASSWORD=AdminPass!234" in run_command
 
 
 def test_recover_running_container_without_restart(monkeypatch):

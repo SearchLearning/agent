@@ -258,6 +258,44 @@ def _resolve_execution_auth_override_from_state() -> tuple[str, str, str] | None
     return mode, "", ""
 
 
+def _resolve_sample_source_defaults(
+    *,
+    sample_doc_json: str = "",
+    source_local_file: str = "",
+    source_index_name: str = "",
+) -> tuple[str, str, str]:
+    """Resolve sample-source arguments, preferring explicit args over engine state."""
+    resolved_sample_doc_json = str(sample_doc_json or "").strip()
+    resolved_source_local_file = str(source_local_file or "").strip()
+    resolved_source_index_name = str(source_index_name or "").strip()
+
+    state = getattr(_engine, "state", None)
+    if state is None:
+        return (
+            resolved_sample_doc_json,
+            resolved_source_local_file,
+            resolved_source_index_name,
+        )
+
+    if not resolved_sample_doc_json:
+        resolved_sample_doc_json = str(
+            getattr(state, "sample_doc_json", "") or ""
+        ).strip()
+    if not resolved_source_local_file:
+        resolved_source_local_file = str(
+            getattr(state, "source_local_file", "") or ""
+        ).strip()
+    if not resolved_source_index_name:
+        resolved_source_index_name = str(
+            getattr(state, "source_index_name", "") or ""
+        ).strip()
+    return (
+        resolved_sample_doc_json,
+        resolved_source_local_file,
+        resolved_source_index_name,
+    )
+
+
 @contextmanager
 def _temporary_execution_auth_env():
     override = _resolve_execution_auth_override_from_state()
@@ -985,14 +1023,23 @@ def create_index(
     source_index_name: str = "",
 ) -> str:
     """Create an OpenSearch index for MCP manual execution mode."""
+    (
+        resolved_sample_doc_json,
+        resolved_source_local_file,
+        resolved_source_index_name,
+    ) = _resolve_sample_source_defaults(
+        sample_doc_json=sample_doc_json,
+        source_local_file=source_local_file,
+        source_index_name=source_index_name,
+    )
     with _temporary_execution_auth_env():
         return create_index_impl(
             index_name=index_name,
             body=body,
             replace_if_exists=replace_if_exists,
-            sample_doc_json=sample_doc_json,
-            source_local_file=source_local_file,
-            source_index_name=source_index_name,
+            sample_doc_json=resolved_sample_doc_json,
+            source_local_file=resolved_source_local_file,
+            source_index_name=resolved_source_index_name,
         )
 
 
@@ -1046,15 +1093,24 @@ async def apply_capability_driven_verification(
     ctx: Context | None = None,
 ) -> dict[str, object]:
     """Apply capability-driven verification and MCP semantic-query rewrite via client LLM."""
+    (
+        resolved_sample_doc_json,
+        resolved_source_local_file,
+        resolved_source_index_name,
+    ) = _resolve_sample_source_defaults(
+        sample_doc_json=sample_doc_json,
+        source_local_file=source_local_file,
+        source_index_name=source_index_name,
+    )
     with _temporary_execution_auth_env():
         result = apply_capability_driven_verification_impl(
             worker_output=worker_output,
             index_name=index_name,
             count=count,
             id_prefix=id_prefix,
-            sample_doc_json=sample_doc_json,
-            source_local_file=source_local_file,
-            source_index_name=source_index_name,
+            sample_doc_json=resolved_sample_doc_json,
+            source_local_file=resolved_source_local_file,
+            source_index_name=resolved_source_index_name,
             existing_verification_doc_ids=existing_verification_doc_ids,
         )
     return await _rewrite_semantic_suggestion_entries_with_client_llm(result=result, ctx=ctx)

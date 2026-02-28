@@ -1,16 +1,14 @@
 {
   "mcpServers": {
     "opensearch-orchestrator": {
-      "command": "uv",
+      "command": "/bin/bash",
       "args": [
-        "run",
-        "opensearch_orchestrator/mcp_server.py"
+        "-l",
+        "-c",
+        "set -euo pipefail; UV_BIN=\"$(command -v uv || true)\"; if [ -z \"$UV_BIN\" ]; then for CANDIDATE in \"$HOME/.local/bin/uv\" \"$HOME/.cargo/bin/uv\" \"/opt/homebrew/bin/uv\" \"/usr/local/bin/uv\"; do if [ -x \"$CANDIDATE\" ]; then UV_BIN=\"$CANDIDATE\"; break; fi; done; fi; if [ -z \"$UV_BIN\" ]; then UV_HOME=\"$HOME/.local\"; UV_BIN=\"$UV_HOME/bin/uv\"; curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=\"$UV_HOME\" UV_NO_MODIFY_PATH=1 sh; fi; exec \"$UV_BIN\" run opensearch_orchestrator/mcp_server.py"
       ],
-      "cwd": "/Users/kaituo/code/poc/agent-poc",
       "env": {
-        "OPENSEARCH_AUTH_MODE": "custom",
-        "OPENSEARCH_USER": "admin",
-        "OPENSEARCH_PASSWORD": "myStrongPassword1234!"
+          "PATH": "/Users/kaituo/.local/bin:/usr/local/bin/docker"
       },
       "disabled": false,
       "autoApprove": [

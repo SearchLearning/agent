@@ -1,9 +1,12 @@
 {
   "mcpServers": {
     "opensearch-orchestrator": {
-      "command": "uvx",
+      "command": "bash",
       "args": [
-        "opensearch-orchestrator@latest"
+        "--noprofile",
+        "--norc",
+        "-c",
+        "set -euo pipefail; PATH=\"$HOME/.local/bin:$HOME/.local:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"; UV_BIN=\"$(command -v uv || true)\"; UVX_BIN=\"$(command -v uvx || true)\"; if [ -z \"$UV_BIN\" ] && [ -z \"$UVX_BIN\" ]; then UV_INSTALL_DIR=\"$HOME/.local/bin\"; mkdir -p \"$UV_INSTALL_DIR\"; curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=\"$UV_INSTALL_DIR\" UV_NO_MODIFY_PATH=1 sh; PATH=\"$UV_INSTALL_DIR:$HOME/.local:$PATH\"; UV_BIN=\"$(command -v uv || true)\"; UVX_BIN=\"$(command -v uvx || true)\"; fi; if [ -n \"$UV_BIN\" ] && [ -x \"$UV_BIN\" ]; then exec \"$UV_BIN\" tool run opensearch-orchestrator@latest; fi; if [ -n \"$UVX_BIN\" ] && [ -x \"$UVX_BIN\" ]; then exec \"$UVX_BIN\" opensearch-orchestrator@latest; fi; echo \"Unable to find uv or uvx after installation attempt.\" >&2; exit 1"
       ],
       "env": {
         "FASTMCP_LOG_LEVEL": "ERROR"

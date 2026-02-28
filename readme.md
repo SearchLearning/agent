@@ -79,9 +79,10 @@ The following execution/knowledge tools are exposed by default for manual client
 Advanced tools (`set_plan`, raw sample-submit variants, indexing helpers, etc.) are hidden by default and only exposed when `OPENSEARCH_MCP_ENABLE_ADVANCED_TOOLS=true`.
 
 Localhost index auth contract (Option 3 / `source_type="localhost_index"`):
-- `localhost_auth_mode="default"`: force `admin` / `myStrongPassword123!`
+- `localhost_auth_mode="default"`: force username `admin` with password `myStrongPassword123!`
 - `localhost_auth_mode="none"`: force no authentication
 - `localhost_auth_mode="custom"`: require `localhost_auth_username` + `localhost_auth_password`
+- Local Docker auto-bootstrap always uses the `admin` username and sets `OPENSEARCH_INITIAL_ADMIN_PASSWORD` from `OPENSEARCH_PASSWORD` when provided (otherwise uses `myStrongPassword123!`).
 
 Planner backend in MCP mode:
 - MCP planning uses client sampling / client LLM only (no Bedrock fallback in MCP mode).

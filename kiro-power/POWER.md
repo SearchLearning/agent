@@ -112,6 +112,59 @@ Your AWS user/role needs permissions for:
 
 Once configured, the AWS MCP servers will be available for Phase 5 deployment.
 
+## Troubleshooting
+
+### If you get a `spawn uvx ENOENT` error or If Docker is running but the MCP server can't find it
+
+Some MCP clients may be unable to find `uvx` or `docker` from the JSON config
+environment. This will result in error messages like
+`Could not connect to MCP server dbt-mcp`, `Error: spawn uvx ENOENT`, or Docker
+not found errors even when Docker is installed and running.
+
+Solution: Locate the full path to `uvx` and `docker`, then ensure your MCP
+`env.PATH` includes that directory:
+
+macOS/Linux:
+- Run `which uvx`
+- Run `which docker` (example output: `/usr/local/bin/docker`)
+
+Windows:
+- Run `where uvx`
+- Run `where docker`
+
+If `which docker` returns `/usr/local/bin/docker`, add `/usr/local/bin` to
+`env.PATH` in your MCP config.
+
+1. Open the Command Palette in Kiro (`Cmd+Shift+P` on macOS, `Ctrl+Shift+P` on Windows/Linux), then run `Kiro: Open user MCP config (JSON)` (or open workspace MCP config).
+2. In `mcpServers`, find the namespaced server entry (for example, `power-kiro-power-opensearch-orchestrator`) and update it to match the example below:
+
+```jsonc
+{
+  "mcpServers": {
+    "opensearch-orchestrator": {
+      "command": "uvx",
+      "args": [
+        "opensearch-orchestrator@latest"
+      ],
+      "env": {
+        "FASTMCP_LOG_LEVEL": "ERROR",
+        "PATH": "/usr/local/bin:/usr/bin:/bin:/opt/anaconda3/bin"
+      },
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}
+```
+
+3. Save. Kiro applies changes on save and reconnects automatically (or reconnect from the MCP panel if needed).
+4. If the connection still fails, open the MCP Server view and retry manually:
+   - Go to `View` -> `Open View`
+   - Type `MCP Servers`
+   - Open the MCP Server view
+   - Retry connect to `power-kiro-power-opensearch-orchestrator`
+
+
 ## Quick Test
 
 After configuration, try: *"I want to build a semantic search app with 10M docs"*
@@ -142,6 +195,10 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 - For option 3, ask for index name first and default to `localhost_auth_mode="default"` unless the user explicitly asks for `none` or `custom`.
 - For option 4, ask for 1-3 representative JSON records before calling `load_sample("paste", ...)`.
 - The result includes `inferred_text_fields` and `text_search_required`.
+- Preserve sample source context for execution tools:
+  - `sample_doc_json`: JSON sample document captured in Phase 1
+  - `source_local_file`: local file path when using built-in IMDB or `local_file`
+  - `source_index_name`: index name when using `localhost_index`
 - A sample document is required before any planning or execution.
 
 ### Phase 2: Gather Preferences
@@ -184,6 +241,12 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 
 ### Phase 4: Execute
 - Call `execute_plan()` to create the index, models, pipelines, and launch the UI.
+- In manual execution mode (client LLM driving operation tools), pass sample source args to
+  `create_index(...)` and `apply_capability_driven_verification(...)` whenever possible:
+  - `sample_doc_json`, `source_local_file`, `source_index_name`
+  - Built-in IMDB path: `opensearch_orchestrator/scripts/sample_data/imdb.title.basics.tsv`
+  - This ensures capability verification samples from multi-record source data instead of a single fallback doc.
+- If these args are omitted, MCP now falls back to Phase 1 session state defaults.
 - If execution fails, the user can fix the issue (e.g., restart Docker) and you
   call `retry_execution()`.
 
@@ -238,6 +301,9 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 | `create_bedrock_embedding_model` | Register a Bedrock embedding model |
 | `create_local_pretrained_model` | Deploy a local pretrained model |
 | `create_and_attach_pipeline` | Create and attach ingest/search pipelines |
+| `apply_capability_driven_verification` | Select/index capability-driven verification docs and emit suggestion metadata |
+| `set_search_ui_suggestions` | Persist suggestion metadata for Search UI bootstrap |
+| `launch_search_ui` | Start Search Builder UI |
 | `index_doc` | Index a document |
 | `delete_doc` | Delete a document |
 

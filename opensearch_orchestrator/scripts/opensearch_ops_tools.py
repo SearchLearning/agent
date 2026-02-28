@@ -33,6 +33,7 @@ OPENSEARCH_DEFAULT_PASSWORD = "myStrongPassword123!"
 OPENSEARCH_DOCKER_IMAGE = os.getenv("OPENSEARCH_DOCKER_IMAGE", "opensearchproject/opensearch:latest")
 OPENSEARCH_DOCKER_CONTAINER = os.getenv("OPENSEARCH_DOCKER_CONTAINER", "opensearch-local")
 OPENSEARCH_DOCKER_START_TIMEOUT = int(os.getenv("OPENSEARCH_DOCKER_START_TIMEOUT", "120"))
+OPENSEARCH_DOCKER_CLI_PATH_ENV = "OPENSEARCH_DOCKER_CLI_PATH"
 SEARCH_UI_HOST = os.getenv("SEARCH_UI_HOST", "127.0.0.1")
 SEARCH_UI_PORT = int(os.getenv("SEARCH_UI_PORT", "8765"))
 try:
@@ -52,6 +53,10 @@ _MODEL_MEMORY_SIGNAL_TOKENS = (
     "outofmemory",
     "circuit_breaking_exception",
     "ml_commons.native_memory_threshold",
+)
+_MODEL_LOCAL_LIMIT_SIGNAL_TOKENS = (
+    "exceed max local model per node limit",
+    "max local model per node limit",
 )
 _AUTH_FAILURE_TOKENS = (
     "401",
@@ -633,9 +638,91 @@ def _is_local_host(host: str) -> bool:
     return host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 
 
+def _docker_cli_candidate_paths() -> list[str]:
+    system_name = platform.system().lower()
+    if system_name == "darwin":
+        return [
+            "/usr/local/bin/docker",
+            "/opt/homebrew/bin/docker",
+            "/Applications/Docker.app/Contents/Resources/bin/docker",
+        ]
+    if system_name == "linux":
+        return [
+            "/usr/bin/docker",
+            "/usr/local/bin/docker",
+            "/snap/bin/docker",
+        ]
+    if system_name == "windows":
+        program_files = os.getenv("ProgramFiles", r"C:\Program Files")
+        program_files_x86 = os.getenv("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        local_app_data = os.getenv("LOCALAPPDATA", "")
+        candidates = [
+            os.path.join(program_files, "Docker", "Docker", "resources", "bin", "docker.exe"),
+            os.path.join(program_files_x86, "Docker", "Docker", "resources", "bin", "docker.exe"),
+        ]
+        if local_app_data:
+            candidates.append(
+                os.path.join(
+                    local_app_data,
+                    "Programs",
+                    "Docker",
+                    "Docker",
+                    "resources",
+                    "bin",
+                    "docker.exe",
+                )
+            )
+        return candidates
+    return []
+
+
+def _resolve_docker_executable() -> str:
+    configured_path = str(os.getenv(OPENSEARCH_DOCKER_CLI_PATH_ENV, "") or "").strip()
+    system_name = platform.system().lower()
+    candidates: list[str] = []
+    if configured_path:
+        candidates.append(configured_path)
+    discovered = shutil.which("docker")
+    if discovered:
+        candidates.append(discovered)
+    if system_name == "windows":
+        discovered_exe = shutil.which("docker.exe")
+        if discovered_exe:
+            candidates.append(discovered_exe)
+    candidates.extend(_docker_cli_candidate_paths())
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate_path = str(candidate or "").strip()
+        if not candidate_path:
+            continue
+        normalized = os.path.expandvars(os.path.expanduser(candidate_path))
+        dedupe_key = normalized.lower() if os.name == "nt" else normalized
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+
+        is_windows_abs = bool(re.match(r"^[A-Za-z]:[\\/]", normalized))
+        if os.path.isabs(normalized) or (system_name == "windows" and is_windows_abs):
+            if os.path.isfile(normalized):
+                return normalized
+            continue
+
+        resolved = shutil.which(normalized)
+        if resolved:
+            return resolved
+
+    raise FileNotFoundError("Docker CLI executable was not found.")
+
+
 def _run_docker_command(command: list[str]) -> subprocess.CompletedProcess:
+    if not command:
+        raise ValueError("Docker command must not be empty.")
+    normalized_command = list(command)
+    if normalized_command[0].lower() in {"docker", "docker.exe"}:
+        normalized_command[0] = _resolve_docker_executable()
     return subprocess.run(
-        command,
+        normalized_command,
         check=True,
         capture_output=True,
         text=True,
@@ -643,33 +730,42 @@ def _run_docker_command(command: list[str]) -> subprocess.CompletedProcess:
 
 
 def _docker_install_hint() -> str:
+    override_hint = (
+        f"If Docker CLI is installed in a non-standard location, set "
+        f"{OPENSEARCH_DOCKER_CLI_PATH_ENV} to its full executable path."
+    )
     system_name = platform.system().lower()
     if system_name == "darwin":
         if shutil.which("brew"):
             return (
                 "Install Docker Desktop with Homebrew: "
                 "'brew install --cask docker && open -a Docker'. "
-                "Official docs: https://docs.docker.com/desktop/setup/install/mac-install/"
+                "Official docs: https://docs.docker.com/desktop/setup/install/mac-install/ "
+                f"{override_hint}"
             )
         return (
             "Install Docker Desktop for macOS: "
-            "https://docs.docker.com/desktop/setup/install/mac-install/"
+            "https://docs.docker.com/desktop/setup/install/mac-install/ "
+            f"{override_hint}"
         )
 
     if system_name == "windows":
         return (
             "Install Docker Desktop for Windows: "
-            "https://docs.docker.com/desktop/setup/install/windows-install/"
+            "https://docs.docker.com/desktop/setup/install/windows-install/ "
+            f"{override_hint}"
         )
 
     if system_name == "linux":
         return (
             "Install Docker Engine for Linux: "
-            "https://docs.docker.com/engine/install/"
+            "https://docs.docker.com/engine/install/ "
+            f"{override_hint}"
         )
 
     return (
-        "Install Docker: https://docs.docker.com/get-started/get-docker/"
+        "Install Docker: https://docs.docker.com/get-started/get-docker/ "
+        f"{override_hint}"
     )
 
 
@@ -689,6 +785,127 @@ def _looks_like_model_memory_pressure(error: object) -> bool:
     return any(token in lowered for token in _MODEL_MEMORY_SIGNAL_TOKENS)
 
 
+def _looks_like_local_model_limit(error: object) -> bool:
+    lowered = normalize_text(error).lower()
+    return any(token in lowered for token in _MODEL_LOCAL_LIMIT_SIGNAL_TOKENS)
+
+
+def _wait_for_ml_task(
+    opensearch_client: OpenSearch,
+    task_id: str,
+    *,
+    max_polls: int = 100,
+    poll_interval_seconds: int = 3,
+) -> tuple[str, dict]:
+    if not task_id:
+        return "FAILED", {"error": "Missing task_id from ML task response."}
+
+    for _ in range(max_polls):
+        task_res = opensearch_client.transport.perform_request(
+            "GET",
+            f"/_plugins/_ml/tasks/{task_id}",
+        )
+        state = normalize_text(task_res.get("state", "")).upper()
+        if state in {"COMPLETED", "FAILED"}:
+            return state, task_res
+        time.sleep(poll_interval_seconds)
+
+    return "TIMEOUT", {}
+
+
+def _list_model_ids_for_undeploy_recovery(
+    opensearch_client: OpenSearch,
+    *,
+    exclude_model_id: str = "",
+    max_models: int = 20,
+) -> list[str]:
+    size = max(1, max_models * 3)
+    try:
+        response = opensearch_client.transport.perform_request(
+            "POST",
+            "/_plugins/_ml/models/_search",
+            body={
+                "size": size,
+                "query": {"match_all": {}},
+            },
+        )
+    except Exception as e:
+        print(
+            f"Failed to list models for undeploy recovery: {e}",
+            file=sys.stderr,
+        )
+        return []
+
+    hits = response.get("hits", {}).get("hits", [])
+    deployed_ids: list[str] = []
+    discovered_ids: list[str] = []
+    seen_ids: set[str] = set()
+
+    for hit in hits:
+        if not isinstance(hit, dict):
+            continue
+        candidate_id = normalize_text(hit.get("_id") or hit.get("model_id") or hit.get("id"))
+        if not candidate_id or candidate_id == exclude_model_id or candidate_id in seen_ids:
+            continue
+        seen_ids.add(candidate_id)
+        discovered_ids.append(candidate_id)
+
+        source = hit.get("_source", {})
+        if not isinstance(source, dict):
+            source = {}
+        state_tokens = [
+            normalize_text(source.get("model_state")).lower(),
+            normalize_text(source.get("deploy_state")).lower(),
+            normalize_text(hit.get("model_state")).lower(),
+            normalize_text(hit.get("deploy_state")).lower(),
+        ]
+        if any("deployed" in token for token in state_tokens if token):
+            deployed_ids.append(candidate_id)
+
+    ordered_ids = deployed_ids or discovered_ids
+    return ordered_ids[:max_models]
+
+
+def _undeploy_model_and_wait(
+    opensearch_client: OpenSearch,
+    model_id: str,
+    *,
+    max_polls: int = 80,
+    poll_interval_seconds: int = 2,
+) -> tuple[bool, str]:
+    try:
+        response = opensearch_client.transport.perform_request(
+            "POST",
+            f"/_plugins/_ml/models/{model_id}/_undeploy",
+        )
+    except Exception as e:
+        return False, f"Undeploy request failed: {e}"
+
+    task_id = normalize_text(response.get("task_id"))
+    if not task_id:
+        # Some distributions may return acknowledgement without an async task id.
+        return True, "Undeploy acknowledged without task id."
+
+    state, task_res = _wait_for_ml_task(
+        opensearch_client,
+        task_id,
+        max_polls=max_polls,
+        poll_interval_seconds=poll_interval_seconds,
+    )
+    if state == "COMPLETED":
+        return True, "Undeploy completed."
+    if state == "FAILED":
+        return False, f"Undeploy failed: {task_res.get('error')}"
+    return False, "Undeploy timed out."
+
+
+def _resolve_initial_admin_password_for_docker_bootstrap() -> str:
+    configured_password = str(os.getenv(OPENSEARCH_PASSWORD_ENV, "") or "").strip()
+    if configured_password:
+        return configured_password
+    return OPENSEARCH_DEFAULT_PASSWORD
+
+
 def _format_model_failure_message(stage: str, error: object) -> str:
     message = f"Model {stage} failed: {error}"
     if _looks_like_model_memory_pressure(error):
@@ -701,6 +918,7 @@ def _format_model_failure_message(stage: str, error: object) -> str:
 
 def _run_new_local_opensearch_container() -> None:
     """Pull and run a new local OpenSearch container."""
+    initial_admin_password = _resolve_initial_admin_password_for_docker_bootstrap()
     _run_docker_command(["docker", "pull", OPENSEARCH_DOCKER_IMAGE])
     _run_docker_command(
         [
@@ -716,9 +934,11 @@ def _run_new_local_opensearch_container() -> None:
             "-e",
             "discovery.type=single-node",
             "-e",
-            "plugins.security.disabled=true",
+            "plugins.security.disabled=false",
             "-e",
-            "DISABLE_INSTALL_DEMO_CONFIG=true",
+            "DISABLE_INSTALL_DEMO_CONFIG=false",
+            "-e",
+            f"OPENSEARCH_INITIAL_ADMIN_PASSWORD={initial_admin_password}",
             "-e",
             "OPENSEARCH_JAVA_OPTS=-Xms4g -Xmx4g",
             OPENSEARCH_DOCKER_IMAGE,
@@ -736,7 +956,7 @@ def _start_local_opensearch_container() -> None:
         _run_docker_command(["docker", "--version"])
     except Exception as e:
         raise RuntimeError(
-            "Docker is not installed or not available in PATH. "
+            "Docker is not installed or its CLI executable could not be discovered. "
             f"{_docker_install_hint()}"
         ) from e
 
@@ -781,7 +1001,7 @@ def recover_local_opensearch_container() -> tuple[bool, str]:
     except Exception:
         return (
             False,
-            "Recovery failed: Docker is not installed or not available in PATH. "
+            "Recovery failed: Docker is not installed or its CLI executable could not be discovered. "
             f"{_docker_install_hint()}",
         )
 
@@ -5041,36 +5261,88 @@ def create_local_pretrained_model(model_name: str) -> str:
         
         # Poll for model ID
         model_id = None
-        for _ in range(100):
-            task_res = opensearch_client.transport.perform_request("GET", f"/_plugins/_ml/tasks/{task_id}")
-            state = task_res.get("state")
-            if state == "COMPLETED":
-                model_id = task_res.get("model_id")
-                break
-            elif state == "FAILED":
-                return _format_model_failure_message("registration", task_res.get("error"))
-            time.sleep(5)
+        register_state, register_task_res = _wait_for_ml_task(
+            opensearch_client,
+            task_id,
+            max_polls=100,
+            poll_interval_seconds=5,
+        )
+        if register_state == "COMPLETED":
+            model_id = register_task_res.get("model_id")
+        elif register_state == "FAILED":
+            return _format_model_failure_message("registration", register_task_res.get("error"))
             
         if not model_id:
             return "Model registration timed out or failed."
         print(f"Model registered: {model_id}", file=sys.stderr)
 
-        # 2. Deploy Model
-        response = opensearch_client.transport.perform_request("POST", f"/_plugins/_ml/models/{model_id}/_deploy")
-        deploy_task_id = response.get("task_id")
-        print(f"Model deployment task started: {deploy_task_id}", file=sys.stderr)
-        
-        # Poll for deployment
-        for _ in range(100):  # Increase timeout for deployment
-            task_res = opensearch_client.transport.perform_request("GET", f"/_plugins/_ml/tasks/{deploy_task_id}")
-            state = task_res.get("state")
-            if state == "COMPLETED":
-                return f"Model '{model_name}' (ID: {model_id}) created and deployed successfully."
-            elif state == "FAILED":
-                return _format_model_failure_message("deployment", task_res.get("error"))
-            time.sleep(3)
+        # 2. Deploy Model with capacity recovery for local-model slot limits.
+        undeployed_model_ids: list[str] = []
+        undeploy_candidates: list[str] = []
 
-        return f"Model deployment timed out. Model ID: {model_id}"
+        while True:
+            response = opensearch_client.transport.perform_request("POST", f"/_plugins/_ml/models/{model_id}/_deploy")
+            deploy_task_id = response.get("task_id")
+            print(f"Model deployment task started: {deploy_task_id}", file=sys.stderr)
+
+            deploy_state, deploy_task_res = _wait_for_ml_task(
+                opensearch_client,
+                deploy_task_id,
+                max_polls=100,
+                poll_interval_seconds=3,
+            )
+            if deploy_state == "COMPLETED":
+                if undeployed_model_ids:
+                    recovered = ", ".join(undeployed_model_ids)
+                    return (
+                        f"Model '{model_name}' (ID: {model_id}) created and deployed successfully "
+                        f"after undeploying model(s): {recovered}."
+                    )
+                return f"Model '{model_name}' (ID: {model_id}) created and deployed successfully."
+            if deploy_state == "TIMEOUT":
+                return f"Model deployment timed out. Model ID: {model_id}"
+
+            deploy_error = deploy_task_res.get("error")
+            if not _looks_like_local_model_limit(deploy_error):
+                return _format_model_failure_message("deployment", deploy_error)
+
+            if not undeploy_candidates:
+                undeploy_candidates = _list_model_ids_for_undeploy_recovery(
+                    opensearch_client,
+                    exclude_model_id=model_id,
+                    max_models=20,
+                )
+            if not undeploy_candidates:
+                return (
+                    f"{_format_model_failure_message('deployment', deploy_error)} "
+                    "Automatic recovery could not find a model to undeploy."
+                )
+
+            undeploy_succeeded = False
+            while undeploy_candidates:
+                candidate_model_id = undeploy_candidates.pop(0)
+                undeploy_ok, undeploy_note = _undeploy_model_and_wait(
+                    opensearch_client,
+                    candidate_model_id,
+                )
+                if undeploy_ok:
+                    undeployed_model_ids.append(candidate_model_id)
+                    print(
+                        f"Undeployed model '{candidate_model_id}' to recover local model capacity.",
+                        file=sys.stderr,
+                    )
+                    undeploy_succeeded = True
+                    break
+                print(
+                    f"Undeploy skipped for model '{candidate_model_id}': {undeploy_note}",
+                    file=sys.stderr,
+                )
+
+            if not undeploy_succeeded:
+                return (
+                    f"{_format_model_failure_message('deployment', deploy_error)} "
+                    "Automatic recovery attempted undeploy, but all candidates failed."
+                )
 
     except Exception as e:
         return f"Error creating local pretrained model: {e}"

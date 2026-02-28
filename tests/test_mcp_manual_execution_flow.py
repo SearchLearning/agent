@@ -153,6 +153,72 @@ def test_set_execution_from_execution_report_updates_engine_phase(monkeypatch) -
     assert mcp_server._engine.phase == mcp_server.Phase.EXEC_FAILED
 
 
+def test_create_index_uses_engine_sample_source_defaults(monkeypatch) -> None:
+    class _State:
+        sample_doc_json = '{"tconst":"tt0000001","primaryTitle":"Carmencita"}'
+        source_local_file = "opensearch_orchestrator/scripts/sample_data/imdb.title.basics.tsv"
+        source_index_name = ""
+
+    class _Engine:
+        state = _State()
+
+    monkeypatch.setattr(mcp_server, "_engine", _Engine())
+
+    captured: dict[str, object] = {}
+
+    def _fake_create_index_impl(**kwargs):
+        captured.update(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(mcp_server, "create_index_impl", _fake_create_index_impl)
+
+    result = mcp_server.create_index(index_name="imdb-movies", body={"settings": {}})
+
+    assert result == "ok"
+    assert captured["sample_doc_json"] == _State.sample_doc_json
+    assert captured["source_local_file"] == _State.source_local_file
+    assert captured["source_index_name"] == ""
+
+
+def test_apply_capability_driven_verification_uses_engine_sample_source_defaults(
+    monkeypatch,
+) -> None:
+    class _State:
+        sample_doc_json = '{"tconst":"tt0000001","primaryTitle":"Carmencita"}'
+        source_local_file = "opensearch_orchestrator/scripts/sample_data/imdb.title.basics.tsv"
+        source_index_name = ""
+
+    class _Engine:
+        state = _State()
+
+    monkeypatch.setattr(mcp_server, "_engine", _Engine())
+
+    captured: dict[str, object] = {}
+
+    def _fake_apply_impl(**kwargs):
+        captured.update(kwargs)
+        return {"applied": True, "suggestion_meta": [], "notes": []}
+
+    monkeypatch.setattr(
+        mcp_server,
+        "apply_capability_driven_verification_impl",
+        _fake_apply_impl,
+    )
+
+    result = asyncio.run(
+        mcp_server.apply_capability_driven_verification(
+            worker_output="worker output",
+            index_name="imdb-movies",
+            ctx=None,
+        )
+    )
+
+    assert result["applied"] is True
+    assert captured["sample_doc_json"] == _State.sample_doc_json
+    assert captured["source_local_file"] == _State.source_local_file
+    assert captured["source_index_name"] == ""
+
+
 def test_apply_capability_driven_verification_rewrites_semantic_text_with_client_llm(
     monkeypatch,
 ) -> None:
