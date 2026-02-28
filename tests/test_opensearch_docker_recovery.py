@@ -13,6 +13,38 @@ def _cp(stdout: str = "") -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
 
 
+def test_new_container_bootstrap_sets_default_admin_password(monkeypatch):
+    calls: list[list[str]] = []
+
+    def _run(command: list[str]):
+        calls.append(command)
+        return _cp("ok")
+
+    monkeypatch.delenv("OPENSEARCH_PASSWORD", raising=False)
+    monkeypatch.setattr(tools, "_run_docker_command", _run)
+
+    tools._run_new_local_opensearch_container()
+
+    run_command = next(cmd for cmd in calls if cmd[:2] == ["docker", "run"])
+    assert "OPENSEARCH_INITIAL_ADMIN_PASSWORD=myStrongPassword123!" in run_command
+
+
+def test_new_container_bootstrap_uses_env_password(monkeypatch):
+    calls: list[list[str]] = []
+
+    def _run(command: list[str]):
+        calls.append(command)
+        return _cp("ok")
+
+    monkeypatch.setenv("OPENSEARCH_PASSWORD", "AdminPass!234")
+    monkeypatch.setattr(tools, "_run_docker_command", _run)
+
+    tools._run_new_local_opensearch_container()
+
+    run_command = next(cmd for cmd in calls if cmd[:2] == ["docker", "run"])
+    assert "OPENSEARCH_INITIAL_ADMIN_PASSWORD=AdminPass!234" in run_command
+
+
 def test_recover_running_container_without_restart(monkeypatch):
     calls: list[list[str]] = []
 

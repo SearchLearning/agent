@@ -112,6 +112,59 @@ Your AWS user/role needs permissions for:
 
 Once configured, the AWS MCP servers will be available for Phase 5 deployment.
 
+## Troubleshooting
+
+### If you get a `spawn uvx ENOENT` error or If Docker is running but the MCP server can't find it
+
+Some MCP clients may be unable to find `uvx` or `docker` from the JSON config
+environment. This will result in error messages like
+`Could not connect to MCP server dbt-mcp`, `Error: spawn uvx ENOENT`, or Docker
+not found errors even when Docker is installed and running.
+
+Solution: Locate the full path to `uvx` and `docker`, then ensure your MCP
+`env.PATH` includes that directory:
+
+macOS/Linux:
+- Run `which uvx`
+- Run `which docker` (example output: `/usr/local/bin/docker`)
+
+Windows:
+- Run `where uvx`
+- Run `where docker`
+
+If `which docker` returns `/usr/local/bin/docker`, add `/usr/local/bin` to
+`env.PATH` in your MCP config.
+
+1. Open the Command Palette in Kiro (`Cmd+Shift+P` on macOS, `Ctrl+Shift+P` on Windows/Linux), then run `Kiro: Open user MCP config (JSON)` (or open workspace MCP config).
+2. In `mcpServers`, find the namespaced server entry (for example, `power-kiro-power-opensearch-orchestrator`) and update it to match the example below:
+
+```jsonc
+{
+  "mcpServers": {
+    "opensearch-orchestrator": {
+      "command": "uvx",
+      "args": [
+        "opensearch-orchestrator@latest"
+      ],
+      "env": {
+        "FASTMCP_LOG_LEVEL": "ERROR",
+        "PATH": "/usr/local/bin:/usr/bin:/bin:/opt/anaconda3/bin"
+      },
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}
+```
+
+3. Save. Kiro applies changes on save and reconnects automatically (or reconnect from the MCP panel if needed).
+4. If the connection still fails, open the MCP Server view and retry manually:
+   - Go to `View` -> `Open View`
+   - Type `MCP Servers`
+   - Open the MCP Server view
+   - Retry connect to `power-kiro-power-opensearch-orchestrator`
+
+
 ## Quick Test
 
 After configuration, try: *"I want to build a semantic search app with 10M docs"*

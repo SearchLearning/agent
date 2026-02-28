@@ -689,6 +689,13 @@ def _looks_like_model_memory_pressure(error: object) -> bool:
     return any(token in lowered for token in _MODEL_MEMORY_SIGNAL_TOKENS)
 
 
+def _resolve_initial_admin_password_for_docker_bootstrap() -> str:
+    configured_password = str(os.getenv(OPENSEARCH_PASSWORD_ENV, "") or "").strip()
+    if configured_password:
+        return configured_password
+    return OPENSEARCH_DEFAULT_PASSWORD
+
+
 def _format_model_failure_message(stage: str, error: object) -> str:
     message = f"Model {stage} failed: {error}"
     if _looks_like_model_memory_pressure(error):
@@ -701,6 +708,7 @@ def _format_model_failure_message(stage: str, error: object) -> str:
 
 def _run_new_local_opensearch_container() -> None:
     """Pull and run a new local OpenSearch container."""
+    initial_admin_password = _resolve_initial_admin_password_for_docker_bootstrap()
     _run_docker_command(["docker", "pull", OPENSEARCH_DOCKER_IMAGE])
     _run_docker_command(
         [
@@ -716,9 +724,11 @@ def _run_new_local_opensearch_container() -> None:
             "-e",
             "discovery.type=single-node",
             "-e",
-            "plugins.security.disabled=true",
+            "plugins.security.disabled=false",
             "-e",
             "DISABLE_INSTALL_DEMO_CONFIG=true",
+            "-e",
+            f"OPENSEARCH_INITIAL_ADMIN_PASSWORD={initial_admin_password}",
             "-e",
             "OPENSEARCH_JAVA_OPTS=-Xms4g -Xmx4g",
             OPENSEARCH_DOCKER_IMAGE,
