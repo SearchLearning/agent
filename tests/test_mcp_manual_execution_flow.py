@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 import sys
 
@@ -258,3 +259,136 @@ def test_apply_capability_driven_verification_rewrites_semantic_text_with_client
     exact_entry = next(item for item in suggestion_meta if item.get("capability") == "exact")
     assert semantic_entry["text"] == "semantic rewritten query"
     assert exact_entry["text"] == "exact title"
+
+
+def test_mcp_state_persistence_round_trip(monkeypatch, tmp_path) -> None:
+    state_file = tmp_path / "mcp_state.json"
+    monkeypatch.setenv(mcp_server._MCP_STATE_PERSIST_ENV, "1")
+    monkeypatch.setenv(mcp_server._MCP_STATE_FILE_ENV, str(state_file))
+
+    class _State:
+        sample_doc_json = '{"tconst":"tt0000001","primaryTitle":"Carmencita"}'
+        source_local_file = "opensearch_orchestrator/scripts/sample_data/imdb.title.basics.tsv"
+        source_index_name = ""
+        source_index_doc_count = 42
+        inferred_text_search_required = True
+        inferred_semantic_text_fields = ["primaryTitle"]
+        budget_preference = "flexible"
+        performance_priority = "balanced"
+        model_deployment_preference = "opensearch-node"
+        prefix_wildcard_enabled = False
+        hybrid_weight_profile = "balanced"
+        pending_localhost_index_options = []
+        localhost_auth_mode = "custom"
+        localhost_auth_username = "admin"
+        localhost_auth_password = "secret"
+
+    class _Engine:
+        state = _State()
+        phase = mcp_server.Phase.GATHER_INFO
+        plan_result = {"solution": "S", "search_capabilities": "C", "keynote": "K"}
+
+    monkeypatch.setattr(mcp_server, "_engine", _Engine())
+    mcp_server._persist_engine_state("test")
+
+    persisted = json.loads(state_file.read_text(encoding="utf-8"))
+    assert persisted["phase"] == "GATHER_INFO"
+    assert persisted["state"]["source_local_file"] == _State.source_local_file
+    assert persisted["state"]["localhost_auth_username"] == "admin"
+    assert "localhost_auth_password" not in persisted["state"]
+    assert persisted["plan_result"]["solution"] == "S"
+
+    class _EmptyState:
+        sample_doc_json = None
+        source_local_file = None
+        source_index_name = None
+        localhost_auth_mode = "default"
+        localhost_auth_username = None
+
+    class _FreshEngine:
+        state = _EmptyState()
+        phase = mcp_server.Phase.COLLECT_SAMPLE
+        plan_result = None
+
+    monkeypatch.setattr(mcp_server, "_engine", _FreshEngine())
+    mcp_server._restore_engine_state_from_file()
+
+    assert mcp_server._engine.phase == mcp_server.Phase.GATHER_INFO
+    assert mcp_server._engine.state.sample_doc_json == _State.sample_doc_json
+    assert mcp_server._engine.state.source_local_file == _State.source_local_file
+    assert mcp_server._engine.state.localhost_auth_username == "admin"
+    assert mcp_server._engine.plan_result == {
+        "solution": "S",
+        "search_capabilities": "C",
+        "keynote": "K",
+    }
+
+
+def test_resolve_sample_source_defaults_prefers_persisted_file(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    state_file = tmp_path / "mcp_state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "phase": "GATHER_INFO",
+                "state": {
+                    "sample_doc_json": '{"origin":"file"}',
+                    "source_local_file": "/tmp/from-file.tsv",
+                    "source_index_name": "from-file-index",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(mcp_server._MCP_STATE_PERSIST_ENV, "1")
+    monkeypatch.setenv(mcp_server._MCP_STATE_FILE_ENV, str(state_file))
+
+    class _State:
+        sample_doc_json = '{"origin":"memory"}'
+        source_local_file = "/tmp/from-memory.tsv"
+        source_index_name = "from-memory-index"
+
+    class _Engine:
+        state = _State()
+
+    monkeypatch.setattr(mcp_server, "_engine", _Engine())
+    resolved = mcp_server._resolve_sample_source_defaults()
+    assert resolved == (
+        '{"origin":"file"}',
+        "/tmp/from-file.tsv",
+        "from-file-index",
+    )
+
+
+def test_load_sample_recreates_persisted_snapshot(monkeypatch) -> None:
+    class _State:
+        sample_doc_json = ""
+        source_local_file = ""
+        source_index_name = ""
+
+    class _Engine:
+        state = _State()
+
+        def load_sample(self, **kwargs):
+            _ = kwargs
+            return {"status": "Sample loaded.", "sample_doc": {}}
+
+    monkeypatch.setattr(mcp_server, "_engine", _Engine())
+
+    captured: dict[str, object] = {}
+
+    def _fake_persist(reason: str = "", *, recreate: bool = False) -> None:
+        captured["reason"] = reason
+        captured["recreate"] = recreate
+
+    monkeypatch.setattr(mcp_server, "_persist_engine_state", _fake_persist)
+
+    result = mcp_server.load_sample(source_type="builtin_imdb")
+
+    assert "error" not in result
+    assert captured["reason"] == "load_sample"
+    assert captured["recreate"] is True

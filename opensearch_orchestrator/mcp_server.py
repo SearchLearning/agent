@@ -22,7 +22,9 @@ if __package__ in {None, ""}:
 
 import errno
 from contextlib import contextmanager
+import json
 import os
+from pathlib import Path
 import re
 import sys
 from typing import Any
@@ -30,6 +32,11 @@ from typing import Any
 import anyio
 from mcp import types as mcp_types
 from mcp.server.fastmcp import Context, FastMCP
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 from opensearch_orchestrator.orchestrator import create_transport_agnostic_engine
 from opensearch_orchestrator.planning_session import PlanningSession
@@ -205,6 +212,189 @@ _VALID_LOCALHOST_AUTH_MODES = {
     _LOCALHOST_AUTH_MODE_NONE,
     _LOCALHOST_AUTH_MODE_CUSTOM,
 }
+_MCP_STATE_PERSIST_ENV = "OPENSEARCH_MCP_PERSIST_STATE"
+_MCP_STATE_FILE_ENV = "OPENSEARCH_MCP_STATE_FILE"
+_DEFAULT_MCP_STATE_FILE = (
+    Path.home() / ".opensearch_orchestrator" / "mcp_state.json"
+)
+_MCP_STATE_VERSION = 1
+_PERSISTED_STATE_FIELDS = (
+    "sample_doc_json",
+    "source_local_file",
+    "source_index_name",
+    "source_index_doc_count",
+    "inferred_text_search_required",
+    "inferred_semantic_text_fields",
+    "budget_preference",
+    "performance_priority",
+    "model_deployment_preference",
+    "prefix_wildcard_enabled",
+    "hybrid_weight_profile",
+    "pending_localhost_index_options",
+    "localhost_auth_mode",
+    "localhost_auth_username",
+)
+
+
+def _mcp_state_persistence_enabled() -> bool:
+    raw = str(os.getenv(_MCP_STATE_PERSIST_ENV, "1") or "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _resolve_mcp_state_file_path() -> Path:
+    configured = str(os.getenv(_MCP_STATE_FILE_ENV, "") or "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return _DEFAULT_MCP_STATE_FILE
+
+
+@contextmanager
+def _mcp_state_file_lock(path: Path):
+    """Best-effort cross-process lock for persisted MCP state operations."""
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_fd: int | None = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        if fcntl is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        if lock_fd is None:
+            return
+        if fcntl is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+        try:
+            os.close(lock_fd)
+        except Exception:
+            pass
+
+
+def _read_persisted_engine_payload() -> dict[str, object]:
+    if not _mcp_state_persistence_enabled():
+        return {}
+
+    path = _resolve_mcp_state_file_path()
+    if not path.exists():
+        return {}
+
+    try:
+        with _mcp_state_file_lock(path):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(
+            f"[mcp_server.state] Failed to read persisted state '{path}': {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return {}
+
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def _read_persisted_state_snapshot() -> dict[str, object]:
+    payload = _read_persisted_engine_payload()
+    state_payload = payload.get("state", {})
+    if isinstance(state_payload, dict):
+        return state_payload
+    return {}
+
+
+def _build_persistable_engine_payload() -> dict[str, object]:
+    state_payload: dict[str, object] = {}
+    state = getattr(_engine, "state", None)
+    if state is not None:
+        for field_name in _PERSISTED_STATE_FIELDS:
+            if not hasattr(state, field_name):
+                continue
+            value = getattr(state, field_name, None)
+            if isinstance(value, tuple):
+                value = list(value)
+            state_payload[field_name] = value
+
+    phase_obj = getattr(_engine, "phase", None)
+    phase_name = str(getattr(phase_obj, "name", "") or "").strip()
+    plan_result = getattr(_engine, "plan_result", None)
+    normalized_plan_result = (
+        dict(plan_result)
+        if isinstance(plan_result, dict)
+        else None
+    )
+    return {
+        "version": _MCP_STATE_VERSION,
+        "phase": phase_name,
+        "state": state_payload,
+        "plan_result": normalized_plan_result,
+    }
+
+
+def _persist_engine_state(reason: str = "", *, recreate: bool = False) -> None:
+    if not _mcp_state_persistence_enabled():
+        return
+
+    path = _resolve_mcp_state_file_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _mcp_state_file_lock(path):
+            if recreate:
+                try:
+                    path.unlink(missing_ok=True)
+                except TypeError:
+                    if path.exists():
+                        path.unlink()
+            payload = _build_persistable_engine_payload()
+            temp_path = path.with_suffix(path.suffix + ".tmp")
+            temp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temp_path.replace(path)
+    except Exception as exc:
+        detail = f" ({reason})" if reason else ""
+        print(
+            f"[mcp_server.state] Failed to persist state{detail}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _restore_engine_state_from_file() -> None:
+    if not _mcp_state_persistence_enabled():
+        return
+
+    payload = _read_persisted_engine_payload()
+    if not isinstance(payload, dict):
+        return
+
+    state_payload = payload.get("state", {})
+    state = getattr(_engine, "state", None)
+    if isinstance(state_payload, dict) and state is not None:
+        for field_name in _PERSISTED_STATE_FIELDS:
+            if field_name not in state_payload:
+                continue
+            try:
+                setattr(state, field_name, state_payload[field_name])
+            except Exception:
+                continue
+
+    phase_name = str(payload.get("phase", "") or "").strip()
+    if phase_name:
+        try:
+            _engine.phase = Phase[phase_name]
+        except Exception:
+            pass
+
+    plan_result = payload.get("plan_result")
+    if isinstance(plan_result, dict):
+        try:
+            _engine.plan_result = dict(plan_result)
+        except Exception:
+            pass
 
 
 def _resolve_planner_mode() -> str:
@@ -224,25 +414,52 @@ def _is_method_not_found_error(exc: Exception) -> bool:
     return "method not found" in message
 
 
+_restore_engine_state_from_file()
+
+
 def _resolve_execution_auth_override_from_state() -> tuple[str, str, str] | None:
     """Return localhost auth override from engine state for localhost-index sessions."""
+    persisted_state = _read_persisted_state_snapshot()
+    persisted_source_index_name = str(
+        persisted_state.get("source_index_name", "") or ""
+    ).strip()
+    persisted_mode = str(
+        persisted_state.get("localhost_auth_mode", _LOCALHOST_AUTH_MODE_DEFAULT) or ""
+    ).strip().lower()
+    persisted_username = str(
+        persisted_state.get("localhost_auth_username", "") or ""
+    ).strip()
+
     state = getattr(_engine, "state", None)
     if state is None:
-        return None
+        if not persisted_source_index_name:
+            return None
+        if persisted_mode not in _VALID_LOCALHOST_AUTH_MODES:
+            persisted_mode = _LOCALHOST_AUTH_MODE_DEFAULT
+        if persisted_mode == _LOCALHOST_AUTH_MODE_CUSTOM and persisted_username:
+            # Password is intentionally not persisted; cannot override custom auth on restart.
+            return None
+        return persisted_mode, "", ""
 
     source_index_name = str(getattr(state, "source_index_name", "") or "").strip()
+    if not source_index_name:
+        source_index_name = persisted_source_index_name
     if not source_index_name:
         return None
 
     mode = str(
         getattr(state, "localhost_auth_mode", _LOCALHOST_AUTH_MODE_DEFAULT) or ""
     ).strip().lower()
+    if not mode:
+        mode = persisted_mode
     if mode not in _VALID_LOCALHOST_AUTH_MODES:
         mode = _LOCALHOST_AUTH_MODE_DEFAULT
 
     if mode == _LOCALHOST_AUTH_MODE_CUSTOM:
         username = str(getattr(state, "localhost_auth_username", "") or "").strip()
         password = str(getattr(state, "localhost_auth_password", "") or "").strip()
+        if not username:
+            username = persisted_username
         if not username or not password:
             return None
         return mode, username, password
@@ -255,10 +472,24 @@ def _resolve_sample_source_defaults(
     source_local_file: str = "",
     source_index_name: str = "",
 ) -> tuple[str, str, str]:
-    """Resolve sample-source arguments, preferring explicit args over engine state."""
+    """Resolve sample-source arguments, preferring explicit args then persisted state."""
     resolved_sample_doc_json = str(sample_doc_json or "").strip()
     resolved_source_local_file = str(source_local_file or "").strip()
     resolved_source_index_name = str(source_index_name or "").strip()
+
+    persisted_state = _read_persisted_state_snapshot()
+    if not resolved_sample_doc_json:
+        resolved_sample_doc_json = str(
+            persisted_state.get("sample_doc_json", "") or ""
+        ).strip()
+    if not resolved_source_local_file:
+        resolved_source_local_file = str(
+            persisted_state.get("source_local_file", "") or ""
+        ).strip()
+    if not resolved_source_index_name:
+        resolved_source_index_name = str(
+            persisted_state.get("source_index_name", "") or ""
+        ).strip()
 
     state = getattr(_engine, "state", None)
     if state is None:
@@ -268,16 +499,11 @@ def _resolve_sample_source_defaults(
             resolved_source_index_name,
         )
 
+    # Compatibility fallback for cases where file persistence is disabled or unavailable.
     if not resolved_sample_doc_json:
         resolved_sample_doc_json = str(
             getattr(state, "sample_doc_json", "") or ""
         ).strip()
-    # it's safe only if a user stays in the same MCP session and
-    # load_sample already populated _engine.state.source_local_file.
-    # When it can still fail:
-    # - New/reset session (state lost).
-    # - Source type was paste (no file path).
-    # - source_local_file is present but not readable at execution time.
     if not resolved_source_local_file:
         resolved_source_local_file = str(
             getattr(state, "source_local_file", "") or ""
@@ -732,13 +958,16 @@ def load_sample(
         dict with sample_doc, inferred_text_fields, text_search_required,
         and status message.
     """
-    return _engine.load_sample(
+    result = _engine.load_sample(
         source_type=source_type,
         source_value=source_value,
         localhost_auth_mode=localhost_auth_mode,
         localhost_auth_username=localhost_auth_username,
         localhost_auth_password=localhost_auth_password,
     )
+    # Entering step 1 starts a fresh persisted conversation snapshot.
+    _persist_engine_state("load_sample", recreate=True)
+    return result
 
 
 @mcp.tool()
@@ -762,12 +991,14 @@ def set_preferences(
     Returns:
         dict confirming stored preferences and generated context notes.
     """
-    return _engine.set_preferences(
+    result = _engine.set_preferences(
         budget=budget,
         performance=performance,
         query_pattern=query_pattern,
         deployment_preference=deployment_preference,
     )
+    _persist_engine_state("set_preferences")
+    return result
 
 
 @mcp.tool()
@@ -842,6 +1073,7 @@ async def start_planning(additional_context: str = "", ctx: Context | None = Non
             planning_agent=_ClientSamplingPlannerAgent(ctx),
         )
         result["planner_backend"] = "client_sampling"
+        _persist_engine_state("start_planning")
         return result
     except Exception as exc:
         if _is_method_not_found_error(exc):
@@ -876,7 +1108,9 @@ async def refine_plan(user_feedback: str) -> dict:
     Returns:
         dict with response text, is_complete flag, and result (if complete).
     """
-    return await _engine.refine_plan(user_feedback)
+    result = await _engine.refine_plan(user_feedback)
+    _persist_engine_state("refine_plan")
+    return result
 
 
 @mcp.tool()
@@ -887,7 +1121,9 @@ async def finalize_plan() -> dict:
     Returns:
         dict with solution, search_capabilities, and keynote.
     """
-    return await _engine.finalize_plan()
+    result = await _engine.finalize_plan()
+    _persist_engine_state("finalize_plan")
+    return result
 
 
 def set_plan(solution: str, search_capabilities: str = "", keynote: str = "") -> dict:
@@ -910,11 +1146,13 @@ def set_plan(solution: str, search_capabilities: str = "", keynote: str = "") ->
     )
     if "error" in normalized:
         return normalized
-    return _engine.set_plan(
+    result = _engine.set_plan(
         solution=str(normalized.get("solution", "")),
         search_capabilities=str(normalized.get("search_capabilities", "")),
         keynote=str(normalized.get("keynote", "")),
     )
+    _persist_engine_state("set_plan")
+    return result
 
 
 @mcp.tool()
@@ -940,11 +1178,13 @@ def set_plan_from_planning_complete(planner_response: str, additional_context: s
     )
     if "error" in normalized:
         return normalized
-    return _engine.set_plan(
+    result = _engine.set_plan(
         solution=str(normalized.get("solution", "")),
         search_capabilities=str(normalized.get("search_capabilities", "")),
         keynote=str(normalized.get("keynote", "")),
     )
+    _persist_engine_state("set_plan_from_planning_complete")
+    return result
 
 
 @mcp.tool()
@@ -1018,6 +1258,7 @@ def set_execution_from_execution_report(
     report = committed.get("execution_report", {})
     status = str(report.get("status", "")).strip().lower() if isinstance(report, dict) else ""
     _engine.phase = Phase.DONE if status == "success" else Phase.EXEC_FAILED
+    _persist_engine_state("set_execution_from_execution_report")
     return {
         "status": str(committed.get("status", "Execution report stored.")),
         "execution_report": report,
