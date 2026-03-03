@@ -190,7 +190,7 @@ For advanced agentic search features:
 
 **For Agentic Search**: Configure conversational agents with QueryPlanningTool to enable natural language search.
 
-Agentic search allows users to ask questions in natural language and have OpenSearch automatically plan and execute the retrieval. This requires OpenSearch 3.2+ and uses Bedrock Claude as the reasoning model.
+Agentic search allows users to ask questions in natural language and have OpenSearch automatically plan and execute the retrieval. This requires OpenSearch 3.3+ and uses Bedrock Claude as the reasoning model.
 
 #### Step 11.1: Create IAM Role for Bedrock Access
 
