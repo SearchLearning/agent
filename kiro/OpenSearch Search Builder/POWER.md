@@ -1,6 +1,6 @@
 ---
 name: "opensearch-search-builder"
-displayName: "OpenSearch Search Builder"
+displayName: "OpenSearch Power"
 description: "Accelerate proof-of-concept search applications with guided, end-to-end architecture planning. Ingests sample documents, captures preferences, designs the solution architecture, provisions indices, ML models, ingest pipelines, and a search UI locally, then deploys to Amazon OpenSearch Service or Amazon OpenSearch Serverless."
 keywords: ["opensearch", "search", "semantic search", "vector search", "hybrid search", "RAG", "embeddings", "knn", "neural search", "BM25", "index", "search architecture", "Amazon OpenSearch", "aws", "serverless", "Amazon OpenSearch Serverless"]
 author: "AWS"
