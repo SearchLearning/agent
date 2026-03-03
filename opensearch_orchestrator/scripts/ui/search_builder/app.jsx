@@ -327,6 +327,7 @@ function App() {
           {!error && <span>semantic: {usedSemantic ? "on" : "off"}</span>}
           {fallbackReason && <span>fallback: {fallbackReason}</span>}
           {error && <span className="error">{error}</span>}
+          {loading && <span className="loading-eval">⏳ Evaluating relevance with LLM...</span>}
         </div>
 
         {loading && (
@@ -341,13 +342,18 @@ function App() {
         <div className="results">
           {results.map((item, idx) => (
             <article
-              className="result-card"
+              className={`result-card ${item.relevance_color ? `relevance-${item.relevance_color}` : ''}`}
               key={item.id || idx}
               style={{ animationDelay: `${idx * 35}ms` }}
             >
               <div className="result-head">
                 <span>ID: {item.id || "(none)"}</span>
                 <span className="score">score {Number(item.score || 0).toFixed(3)}</span>
+                {item.relevance_score !== undefined && (
+                  <span className={`relevance-badge relevance-${item.relevance_color}`}>
+                    {item.relevance_score === 1 ? "✓ Relevant" : "✗ Not Relevant"}
+                  </span>
+                )}
               </div>
               <div className="preview">{item.preview}</div>
               <details>

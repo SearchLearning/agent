@@ -377,6 +377,16 @@ body {
   animation: slide-up 260ms ease-out both;
 }
 
+.result-card.relevance-green {
+  border-left: 4px solid #10b981;
+  background: linear-gradient(90deg, #ecfdf5 0%, var(--card) 20%);
+}
+
+.result-card.relevance-red {
+  border-left: 4px solid #ef4444;
+  background: linear-gradient(90deg, #fef2f2 0%, var(--card) 20%);
+}
+
 .result-head {
   display: flex;
   gap: 10px;
@@ -386,6 +396,27 @@ body {
   font-size: 14px;
   color: #1b3653;
   margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+
+.relevance-badge {
+  font-size: 12px;
+  font-weight: 700;
+  padding: 3px 10px;
+  border-radius: 999px;
+  letter-spacing: 0.02em;
+}
+
+.relevance-badge.relevance-green {
+  color: #065f46;
+  background: #d1fae5;
+  border: 1px solid #10b981;
+}
+
+.relevance-badge.relevance-red {
+  color: #991b1b;
+  background: #fee2e2;
+  border: 1px solid #ef4444;
 }
 
 .score {

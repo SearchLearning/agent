@@ -78,6 +78,7 @@ from opensearch_orchestrator.scripts.opensearch_ops_tools import (
     set_search_ui_suggestions as set_search_ui_suggestions_impl,
     RUNTIME_MODE_ENV,
     RUNTIME_MODE_MCP,
+    set_search_relevance_scores as set_search_relevance_scores_impl,
 )
 from opensearch_orchestrator.worker import (
     SYSTEM_PROMPT as WORKER_SYSTEM_PROMPT,
@@ -1497,6 +1498,136 @@ mcp.tool()(read_sparse_vector_models)
 mcp.tool()(search_opensearch_org)
 
 
+@mcp.tool()
+async def search_relevance_evaluation(
+    ctx: Context,
+    index_name: str,
+    queries: str,
+    evaluation_criteria: str = "Evaluate if the search results are relevant to the query based on semantic meaning and context.",
+) -> dict:
+    """Evaluate search relevance for queries using Kiro's LLM.
+
+    This tool executes multiple search queries against an index and evaluates
+    the relevance of returned results using Kiro's LLM. Each result is scored 
+    as 1 (relevant/green) or 0 (not relevant/red) based on LLM judgment.
+
+    The relevance scores are automatically stored and will be displayed in the
+    search UI with color coding (green for relevant, red for not relevant).
+
+    Args:
+        ctx: MCP context (automatically provided)
+        index_name: The OpenSearch index to search against.
+        queries: Comma-separated list of search queries to evaluate.
+        evaluation_criteria: Criteria for determining relevance (optional).
+
+    Returns:
+        dict with evaluation results including query, results, and relevance scores.
+    """
+    import json
+    from opensearch_orchestrator.scripts.opensearch_ops_tools import (
+        _create_client,
+        _search_ui_search,
+        _search_ui_suggestions,
+        _evaluate_relevance_with_llm,
+    )
+
+    if not index_name:
+        return {"error": "index_name is required"}
+
+    if not queries:
+        return {"error": "queries parameter is required (comma-separated list)"}
+
+    # Parse queries
+    query_list = [q.strip() for q in queries.split(",") if q.strip()]
+
+    if not query_list:
+        return {"error": "No valid queries provided"}
+
+    # Get suggestions for the index to understand capabilities
+    suggestions_data = _search_ui_suggestions(index_name)
+
+    evaluation_results = []
+    all_relevance_scores = {}  # Collect all doc_id -> relevance_score mappings
+
+    for query in query_list:
+        # Execute search
+        search_result = _search_ui_search(
+            index_name=index_name,
+            query_text=query,
+            size=20,
+            debug=True,
+        )
+
+        if search_result.get("error"):
+            evaluation_results.append({
+                "query": query,
+                "error": search_result["error"],
+                "results": [],
+            })
+            continue
+
+        hits = search_result.get("hits", [])
+
+        # Evaluate each result using Kiro's LLM
+        evaluated_hits = []
+        for hit in hits:
+            score = float(hit.get("score", 0))
+            preview = str(hit.get("preview", "")).lower()
+            query_lower = query.lower()
+            doc_id = hit.get("id")
+            source = hit.get("source", {})
+
+            # Use LLM to evaluate relevance
+            is_relevant = await _evaluate_relevance_with_llm(
+                query=query,
+                doc_source=source,
+                ctx=ctx,
+            )
+            
+            # If LLM evaluation failed (-1), fall back to heuristic
+            if is_relevant == -1:
+                query_terms = query_lower.split()
+                terms_in_preview = sum(1 for term in query_terms if term in preview)
+                term_coverage = terms_in_preview / len(query_terms) if query_terms else 0
+                is_relevant = 1 if (score > 1.0 or term_coverage > 0.5) else 0
+
+            # Store for batch update
+            if doc_id:
+                all_relevance_scores[doc_id] = is_relevant
+
+            evaluated_hits.append({
+                "id": doc_id,
+                "score": score,
+                "preview": hit.get("preview"),
+                "relevance_score": is_relevant,
+                "relevance_color": "green" if is_relevant == 1 else "red",
+            })
+
+        evaluation_results.append({
+            "query": query,
+            "capability": search_result.get("capability", ""),
+            "query_mode": search_result.get("query_mode", ""),
+            "total_results": len(evaluated_hits),
+            "relevant_count": sum(1 for h in evaluated_hits if h["relevance_score"] == 1),
+            "not_relevant_count": sum(1 for h in evaluated_hits if h["relevance_score"] == 0),
+            "results": evaluated_hits,
+        })
+
+    # Store all relevance scores for the UI
+    if all_relevance_scores:
+        set_search_relevance_scores_impl(index_name, json.dumps(all_relevance_scores))
+
+    return {
+        "index_name": index_name,
+        "evaluation_criteria": evaluation_criteria,
+        "queries_evaluated": len(query_list),
+        "evaluations": evaluation_results,
+        "message": f"Relevance scores stored for {len(all_relevance_scores)} documents. They will appear color-coded in the search UI.",
+    }
+
+
+
+
 # -------------------------------------------------------------------------
 # MCP prompt (for Claude Desktop and generic MCP clients)
 # -------------------------------------------------------------------------
@@ -1529,6 +1660,7 @@ if _advanced_tools_enabled():
     mcp.tool()(delete_doc_impl)
     mcp.tool()(preview_cap_driven_verification_impl)
     mcp.tool()(cleanup_ui_server_impl)
+    mcp.tool()(set_search_relevance_scores_impl)
 
 
 def _flatten_exception_leaves(exc: BaseException) -> list[BaseException]:
