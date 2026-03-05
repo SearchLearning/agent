@@ -1459,7 +1459,33 @@ async def apply_capability_driven_verification(
             existing_verification_doc_ids=existing_verification_doc_ids,
         )
     # write semantic query
-    return await _rewrite_semantic_suggestion_entries_with_client_llm(result=result, ctx=ctx)
+    result = await _rewrite_semantic_suggestion_entries_with_client_llm(result=result, ctx=ctx)
+    
+    # Automatically evaluate auto-generated suggestions if context is available
+    if ctx is not None and index_name:
+        try:
+            eval_result = await search_relevance_evaluation(
+                ctx=ctx,
+                index_name=index_name,
+                queries="",  # Empty = use auto-generated suggestions
+                size=20,
+            )
+            # Add evaluation info to result
+            if "error" not in eval_result:
+                result["auto_evaluation"] = {
+                    "queries": eval_result.get("queries", ""),
+                    "queries_evaluated": eval_result.get("queries_evaluated", 0),
+                    "total_scores_stored": eval_result.get("total_scores_stored", 0),
+                    "message": eval_result.get("message", ""),
+                }
+        except Exception as e:
+            # Don't fail the whole operation if evaluation fails
+            result["auto_evaluation"] = {
+                "error": f"Auto-evaluation failed: {str(e)}",
+                "note": "Suggestions were created but not evaluated. You can manually call search_relevance_evaluation.",
+            }
+    
+    return result
 
 
 @mcp.tool()
@@ -1502,30 +1528,39 @@ mcp.tool()(search_opensearch_org)
 async def search_relevance_evaluation(
     ctx: Context,
     index_name: str,
-    queries: str,
+    queries: str = "",
+    size: int = 20,
     evaluation_criteria: str = "Evaluate if the search results are relevant to the query based on semantic meaning and context.",
 ) -> dict:
     """Evaluate search relevance for queries using Kiro's LLM.
 
-    This tool executes multiple search queries against an index and evaluates
-    the relevance of returned results using Kiro's LLM. Each result is scored 
-    as 1 (relevant/green) or 0 (not relevant/red) based on LLM judgment.
-
-    The relevance scores are automatically stored and will be displayed in the
-    search UI with color coding (green for relevant, red for not relevant).
+    This tool evaluates search results and stores relevance scores that appear
+    as color-coded badges in the UI (green=relevant, red=not relevant).
 
     Args:
         ctx: MCP context (automatically provided)
         index_name: The OpenSearch index to search against.
-        queries: Comma-separated list of search queries to evaluate.
+        queries: Search queries to evaluate (comma-separated).
+                 If empty, automatically uses suggestions from the UI.
+                 Examples: "space opera" or "comedy, drama, action"
+        size: Number of results to evaluate per query (default: 20).
         evaluation_criteria: Criteria for determining relevance (optional).
 
     Returns:
-        dict with evaluation results including query, results, and relevance scores.
+        dict with evaluation results and stored relevance scores.
+        
+    Examples:
+        # Use auto-generated suggestions (empty queries)
+        search_relevance_evaluation(ctx, "imdb_movies")
+        
+        # Evaluate single query
+        search_relevance_evaluation(ctx, "imdb_movies", "space opera")
+        
+        # Evaluate multiple queries
+        search_relevance_evaluation(ctx, "imdb_movies", "comedy, drama, action")
     """
     import json
     from opensearch_orchestrator.scripts.opensearch_ops_tools import (
-        _create_client,
         _search_ui_search,
         _search_ui_suggestions,
         _evaluate_relevance_with_llm,
@@ -1534,27 +1569,38 @@ async def search_relevance_evaluation(
     if not index_name:
         return {"error": "index_name is required"}
 
-    if not queries:
-        return {"error": "queries parameter is required (comma-separated list)"}
-
-    # Parse queries
-    query_list = [q.strip() for q in queries.split(",") if q.strip()]
-
-    if not query_list:
-        return {"error": "No valid queries provided"}
-
-    # Get suggestions for the index to understand capabilities
-    suggestions_data = _search_ui_suggestions(index_name)
+    # Determine query source
+    query_list = []
+    query_source = ""
+    
+    if not queries or not queries.strip():
+        # No queries provided - use auto-generated suggestions from UI
+        suggestions_list, _ = _search_ui_suggestions(index_name, max_count=10)
+        if not suggestions_list:
+            return {
+                "error": "No auto-generated suggestions found and no queries provided. Make sure the index has documents or provide explicit queries.",
+                "index_name": index_name,
+            }
+        query_list = [q.strip() for q in suggestions_list if q.strip()]
+        query_source = "auto_suggestions"
+        # Populate the queries parameter with what we're actually evaluating
+        queries = ", ".join(query_list)
+    else:
+        # Parse explicit queries (single or comma-separated)
+        query_list = [q.strip() for q in queries.split(",") if q.strip()]
+        if not query_list:
+            return {"error": "No valid queries provided"}
+        query_source = "explicit"
 
     evaluation_results = []
-    all_relevance_scores = {}  # Collect all doc_id -> relevance_score mappings
+    all_relevance_scores = {}
 
     for query in query_list:
         # Execute search
         search_result = _search_ui_search(
             index_name=index_name,
             query_text=query,
-            size=20,
+            size=size,
             debug=True,
         )
 
@@ -1567,9 +1613,9 @@ async def search_relevance_evaluation(
             continue
 
         hits = search_result.get("hits", [])
+        evaluated_hits = []
 
         # Evaluate each result using Kiro's LLM
-        evaluated_hits = []
         for hit in hits:
             score = float(hit.get("score", 0))
             preview = str(hit.get("preview", "")).lower()
@@ -1591,9 +1637,10 @@ async def search_relevance_evaluation(
                 term_coverage = terms_in_preview / len(query_terms) if query_terms else 0
                 is_relevant = 1 if (score > 1.0 or term_coverage > 0.5) else 0
 
-            # Store for batch update
+            # Store with composite key (query::doc_id)
             if doc_id:
-                all_relevance_scores[doc_id] = is_relevant
+                composite_key = f"{query}::{doc_id}"
+                all_relevance_scores[composite_key] = is_relevant
 
             evaluated_hits.append({
                 "id": doc_id,
@@ -1613,16 +1660,19 @@ async def search_relevance_evaluation(
             "results": evaluated_hits,
         })
 
-    # Store all relevance scores for the UI
+    # Store all relevance scores
     if all_relevance_scores:
         set_search_relevance_scores_impl(index_name, json.dumps(all_relevance_scores))
 
     return {
         "index_name": index_name,
+        "queries": queries,  # Show what was actually evaluated
+        "query_source": query_source,
         "evaluation_criteria": evaluation_criteria,
         "queries_evaluated": len(query_list),
         "evaluations": evaluation_results,
-        "message": f"Relevance scores stored for {len(all_relevance_scores)} documents. They will appear color-coded in the search UI.",
+        "total_scores_stored": len(all_relevance_scores),
+        "message": f"Evaluated {len(query_list)} queries and stored {len(all_relevance_scores)} relevance scores.",
     }
 
 
@@ -1661,6 +1711,7 @@ if _advanced_tools_enabled():
     mcp.tool()(preview_cap_driven_verification_impl)
     mcp.tool()(cleanup_ui_server_impl)
     mcp.tool()(set_search_relevance_scores_impl)
+
 
 
 def _flatten_exception_leaves(exc: BaseException) -> list[BaseException]:

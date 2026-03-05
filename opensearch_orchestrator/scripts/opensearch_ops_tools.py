@@ -91,7 +91,8 @@ class _SearchUIRuntime:
         self.default_index: str = ""
         self.lock = threading.Lock()
         self.suggestion_meta_by_index: dict[str, list[dict[str, object]]] = {}
-        self.relevance_scores: dict[str, dict[str, int]] = {}  # {index_name: {doc_id: relevance_score}}
+        # Composite key relevance scores: {index_name: {"query::doc_id": relevance_score}}
+        self.relevance_scores: dict[str, dict[str, int]] = {}
 
 _search_ui = _SearchUIRuntime()
 
@@ -4163,26 +4164,27 @@ def _search_ui_search(
     for hit in response.get("hits", {}).get("hits", []):
         source = hit.get("_source", {})
         doc_id = hit.get("_id")
-        relevance_score = relevance_map.get(doc_id, None)
         
-        # Auto-evaluate relevance using simple heuristic (LLM evaluation removed)
-        # Note: For LLM-based evaluation, use the search_relevance_evaluation MCP tool
-        if relevance_score is None and query:
-            # Fallback to simple heuristic
-            score = float(hit.get("_score", 0))
-            preview = _search_ui_preview_text(source).lower()
-            query_lower = query.lower()
-            relevance_score = 1 if (score > 0.5 or query_lower in preview) else 0
+        # query-specific composite key (query::doc_id)
+        relevance_score = None
+        if query and doc_id:
+            composite_key = f"{query}::{doc_id}"
+            relevance_score = relevance_map.get(composite_key, None)
         
+        # Build hit data
         hit_data = {
             "id": doc_id,
             "score": hit.get("_score"),
             "preview": _search_ui_preview_text(source),
             "source": source,
         }
+        
+        # Only add relevance indicators if we have an LLM-evaluated score
+        # Results without scores will have no color badge (blank)
         if relevance_score is not None:
             hit_data["relevance_score"] = relevance_score
             hit_data["relevance_color"] = "green" if relevance_score == 1 else "red"
+        
         hits_out.append(hit_data)
     return {
         "error": "",
@@ -5737,6 +5739,8 @@ def set_search_ui_suggestions(index_name: str, suggestion_meta_json: str) -> str
         return f"Invalid suggestion_meta_json: {e}"
     if not isinstance(parsed, list):
         return "suggestion_meta_json must be a JSON array."
+    # Reload state before modifying to avoid overwriting concurrent changes
+    _maybe_reload_ui_state()
     _search_ui.suggestion_meta_by_index[target] = parsed
     _write_ui_state()
     return f"Set {len(parsed)} suggestions for index '{target}'."
@@ -5745,8 +5749,11 @@ def set_search_relevance_scores(index_name: str, relevance_data_json: str) -> st
 
     Args:
         index_name: Target index name.
-        relevance_data_json: JSON object mapping doc_id to relevance_score (0 or 1).
-            Example: {"doc1": 1, "doc2": 0, "doc3": 1}
+        relevance_data_json: JSON object mapping composite keys "query::doc_id" to relevance_score (0 or 1).
+            Examples:
+            - Composite key format: {"action movies::doc1": 1, "action movies::doc2": 0}
+            The composite key format prevents score collisions when the same document
+            appears in multiple queries with different relevance.
 
     Returns:
         str: Success message or error.
@@ -5762,10 +5769,12 @@ def set_search_relevance_scores(index_name: str, relevance_data_json: str) -> st
         return "relevance_data_json must be a JSON object."
 
     # Validate scores are 0 or 1
-    for doc_id, score in parsed.items():
+    for composite_key, score in parsed.items():
         if score not in (0, 1):
-            return f"Invalid relevance score for doc '{doc_id}': {score}. Must be 0 or 1."
+            return f"Invalid relevance score for '{composite_key}': {score}. Must be 0 or 1."
 
+    # Reload state before modifying to avoid overwriting concurrent changes
+    _maybe_reload_ui_state()
     _search_ui.relevance_scores[target] = parsed
     _write_ui_state()
     return f"Set relevance scores for {len(parsed)} documents in index '{target}'."
