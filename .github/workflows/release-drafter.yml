@@ -36,6 +36,7 @@ jobs:
           python-version: '3.10'
       - name: Build with Python
         run: |
+          pip install uv
           uv run pytest -q
           python -c "import tomllib; p=tomllib.load(open('pyproject.toml','rb')); import opensearch_orchestrator as pkg; print('pyproject=', p['project']['version'], 'package=', pkg.__version__)"
 
