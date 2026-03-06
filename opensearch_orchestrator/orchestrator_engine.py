@@ -449,6 +449,108 @@ class OrchestratorEngine:
         self.phase = Phase.DONE if latest_status == "success" else Phase.EXEC_FAILED
         return {"execution_report": worker_result}
 
+    def prepare_aws_deployment(self) -> dict[str, object]:
+        """Build structured context for AWS deployment (Phase 5).
+
+        Returns deployment target, search strategy, local config extracted
+        from the finalized plan and session state.
+        """
+        if self.phase != Phase.DONE:
+            return {
+                "error": (
+                    "AWS deployment requires successful local execution (Phase 4). "
+                    "Current phase: " + str(getattr(self.phase, "name", self.phase))
+                )
+            }
+        if self.plan_result is None:
+            return {"error": "No finalized plan available."}
+
+        solution = str(self.plan_result.get("solution", "")).lower()
+        capabilities = str(self.plan_result.get("search_capabilities", ""))
+        keynote = str(self.plan_result.get("keynote", ""))
+
+        # Detect primary search strategy from the solution text.
+        strategy = "bm25"
+        if "agentic" in solution:
+            strategy = "agentic"
+        elif "hybrid" in solution:
+            strategy = "hybrid"
+        elif "neural sparse" in solution or "sparse_encoding" in solution:
+            strategy = "neural_sparse"
+        elif (
+            "dense vector" in solution
+            or "knn" in solution
+            or "hnsw" in solution
+            or "text_embedding" in solution
+        ):
+            strategy = "dense_vector"
+
+        # Deployment target: agentic requires domain, everything else uses serverless.
+        deployment_target = "domain" if strategy == "agentic" else "serverless"
+
+        state = self.state
+        sample_doc = None
+        if state.sample_doc_json:
+            try:
+                sample_doc = json.loads(state.sample_doc_json)
+            except (json.JSONDecodeError, TypeError):
+                sample_doc = None
+
+        text_fields = list(state.inferred_semantic_text_fields or [])
+
+        return {
+            "deployment_target": deployment_target,
+            "search_strategy": strategy,
+            "steering_files": (
+                [
+                    "steering/aws/domain-01-provision.md",
+                    "steering/aws/domain-02-deploy-search.md",
+                    "steering/aws/domain-03-agentic-setup.md",
+                ]
+                if deployment_target == "domain"
+                else [
+                    "steering/aws/serverless-01-provision.md",
+                    "steering/aws/serverless-02-deploy-search.md",
+                ]
+            ),
+            "local_config": {
+                "text_fields": text_fields,
+                "sample_doc": sample_doc,
+                "budget": state.budget_preference,
+                "performance": state.performance_priority,
+                "deployment_preference": state.model_deployment_preference,
+                "hybrid_weight_profile": state.hybrid_weight_profile,
+            },
+            "plan_summary": {
+                "solution": str(self.plan_result.get("solution", "")),
+                "search_capabilities": capabilities,
+                "keynote": keynote,
+            },
+            "required_mcp_servers": [
+                "awslabs.aws-api-mcp-server",
+                "opensearch-mcp-server",
+                "aws-docs",
+            ],
+            "state_file_template": {
+                "deployment_target": deployment_target,
+                "search_strategy": strategy,
+                "step_completed": None,
+                "aws_account_id": None,
+                "aws_region": None,
+                "principal_arn": None,
+                "resource_name": None,
+                "resource_endpoint": None,
+                "iam_role_arn": None,
+                "connector_id": None,
+                "model_id": None,
+                "model_group_id": None,
+                "agent_id": None,
+                "index_name": None,
+                "ingest_pipeline_name": None,
+                "search_pipeline_name": None,
+            },
+        }
+
     def build_retry_execution_context(self) -> dict[str, object]:
         """Build retry execution context without running the worker."""
         worker_state = self._get_last_worker_run_state()

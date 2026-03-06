@@ -84,7 +84,7 @@ POST /opensearchserverless/CreateAccessPolicy
 {
   "name": "<collection-name>-data-policy",
   "type": "data",
-  "policy": "[{\"Rules\":[{\"ResourceType\":\"index\",\"Resource\":[\"index/<collection-name>/*\"],\"Permission\":[\"aoss:CreateIndex\",\"aoss:DescribeIndex\",\"aoss:UpdateIndex\",\"aoss:DeleteIndex\",\"aoss:ReadDocument\",\"aoss:WriteDocument\"]},{\"ResourceType\":\"collection\",\"Resource\":[\"collection/<collection-name>\"],\"Permission\":[\"aoss:CreateCollectionItems\",\"aoss:DescribeCollectionItems\"]},{\"ResourceType\":\"model\",\"Resource\":[\"model/<collection-name>/*\"],\"Permission\":[\"aoss:CreateMLResource\"]}],\"Principal\":[\"arn:aws:iam::<account-id>:role/<role-name>\"]}]"
+  "policy": "[{\"Rules\":[{\"ResourceType\":\"index\",\"Resource\":[\"index/<collection-name>/*\"],\"Permission\":[\"aoss:CreateIndex\",\"aoss:DescribeIndex\",\"aoss:UpdateIndex\",\"aoss:DeleteIndex\",\"aoss:ReadDocument\",\"aoss:WriteDocument\"]},{\"ResourceType\":\"collection\",\"Resource\":[\"collection/<collection-name>\"],\"Permission\":[\"aoss:CreateCollectionItems\",\"aoss:DescribeCollectionItems\"]},{\"ResourceType\":\"model\",\"Resource\":[\"model/<collection-name>/*\"],\"Permission\":[\"aoss:*\"]}],\"Principal\":[\"arn:aws:iam::<account-id>:role/<role-name>\"]}]"
 }
 ```
 

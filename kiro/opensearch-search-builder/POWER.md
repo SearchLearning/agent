@@ -266,16 +266,21 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 ### Phase 5: Deploy to AWS OpenSearch (optional)
 - After successful local execution, offer to deploy the search strategy to AWS OpenSearch.
 - **Important**: Before starting Phase 5, guide the user to add AWS MCP servers to the power's mcp.json configuration (see AWS Setup in Onboarding section). Verify the servers are configured before proceeding.
-- Choose deployment target based on search strategy:
-  - **OpenSearch Serverless (AOSS)**: For Neural Sparse, Dense Vector, BM25, and Hybrid search
-  - **OpenSearch Domain (AOS)**: Required for Agentic Search; also supports all other strategies
-- Use AWS API MCP tools (from the aws-api-mcp-server) to provision resources.
-- Use OpenSearch MCP tools (from opensearch-mcp-server) to interact with the deployed cluster.
-- Follow the appropriate AWS deployment steering file:
-  - `aws-opensearch-serverless.md` for AOSS deployment
-  - `aws-opensearch-domain.md` for AOS deployment (Agentic Search)
-- Migrate the local configuration (indices, models, pipelines) to AWS.
-- Configure AWS-specific settings (IAM roles, security, network access).
+- Call `prepare_aws_deployment()` to get the deployment context. This returns:
+  - `deployment_target`: "serverless" or "domain" (determined automatically from search strategy)
+  - `search_strategy`: the detected strategy (bm25, neural_sparse, dense_vector, hybrid, agentic)
+  - `steering_files`: ordered list of steering files to follow
+  - `local_config`: extracted configuration from local setup (text fields, sample doc, preferences)
+  - `required_mcp_servers`: MCP servers that must be connected
+  - `state_file_template`: JSON template for `.opensearch-deploy-state.json`
+- Write the `state_file_template` to `.opensearch-deploy-state.json` in the project root.
+- Verify all `required_mcp_servers` are connected before proceeding.
+- Follow each steering file from `steering_files` in order:
+  - **Serverless track**: `serverless-01-provision.md` → `serverless-02-deploy-search.md`
+  - **Domain track**: `domain-01-provision.md` → `domain-02-deploy-search.md` → `domain-03-agentic-setup.md` (agentic only)
+- Between each steering file, read `.opensearch-deploy-state.json` for accumulated state (ARNs, IDs, endpoints).
+- After each major step, update `.opensearch-deploy-state.json` with new values as instructed by the steering file.
+- For cost, security, or HA questions, refer to `aws-reference.md`.
 - Provide the user with AWS endpoint URLs and access instructions.
 
 ### Post-Execution
@@ -298,6 +303,7 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 | `execute_plan` | 4 | Execute the plan (create index, models, pipelines, UI) |
 | `set_execution_from_execution_report` | 4 | Parse/store finalized worker output for manual execution mode |
 | `retry_execution` | 4 | Resume from a failed execution step |
+| `prepare_aws_deployment` | 5 | Get deployment target, local config, steering file list, and state template for AWS deployment |
 | `cleanup` | Post | Remove test documents on user request |
 
 ### Knowledge Tools

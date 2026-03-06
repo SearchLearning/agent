@@ -38,6 +38,7 @@ def test_default_tool_surface_is_workflow_only() -> None:
         "finalize_plan",
         "launch_search_ui",
         "load_sample",
+        "prepare_aws_deployment",
         "read_agentic_search_guide",
         "read_dense_vector_models",
         "read_knowledge_base",

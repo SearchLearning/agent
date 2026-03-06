@@ -1478,6 +1478,21 @@ def set_search_ui_suggestions(index_name: str, suggestion_meta_json: str) -> str
 
 
 @mcp.tool()
+def prepare_aws_deployment() -> dict:
+    """Prepare structured context for deploying the local search strategy to AWS OpenSearch.
+    Call after successful Phase 4 execution.
+
+    Returns deployment target (serverless or domain), search strategy, local configuration,
+    list of steering files to follow in order, required MCP servers, and a state file
+    template for tracking deployment progress.
+    """
+    result = _engine.prepare_aws_deployment()
+    if "error" not in result:
+        _persist_engine_state("prepare_aws_deployment")
+    return result
+
+
+@mcp.tool()
 def cleanup() -> str:
     """Remove verification/test documents from the OpenSearch index.
     Call only when the user explicitly asks for cleanup.
