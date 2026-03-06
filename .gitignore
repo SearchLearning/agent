@@ -219,3 +219,6 @@ test.ipynb
 # IDE-specific local config (not part of the repo)
 .cursor/
 local/
+
+# Kiro local settings
+.kiro/

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "opensearch-launchpad"
-version = "0.1.0"
+version = "0.1.1"
 description = "OpenSearch Solution Architect MCP server — guides you from requirements to a running search setup"
 readme = "readme.md"
 requires-python = ">=3.10"
