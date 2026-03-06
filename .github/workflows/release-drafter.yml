@@ -1,0 +1,61 @@
+name: Release drafter
+
+on:
+  push:
+    tags:
+      - "*"
+
+jobs:
+  draft-a-release:
+    name: Draft a release
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: write
+      id-token: write
+    if: github.repository == 'opensearch-project/opensearch-launchpad'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+      - id: get_data
+        run: |
+          echo "approvers=$(cat .github/CODEOWNERS | grep @ | tr -d '*\n ' | sed 's/@/,/g' | sed 's/,//1')" >> $GITHUB_OUTPUT
+          VERSION=`cat pyproject.toml | grep "version =" | grep -Eo "[0-9.]+"`
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+      - uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.TOKEN }}
+          approvers: ${{ steps.get_data.outputs.approvers }}
+          minimum-approvals: 1
+          issue-title: 'Release OpenSearch Launchpad ${{ steps.get_data.outputs.version }}'
+          issue-body: "Please approve or deny the release of OpenSearch Launchpad **TAG**: ${{ github.ref_name }}  **COMMIT**: ${{ github.sha }} **VERSION** : ${{ steps.get_data.outputs.version }} "
+          exclude-workflow-initiator-as-approver: true
+      - name: Set up Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Build with Python
+        run: |
+          uv run pytest -q
+          python -c "import tomllib; p=tomllib.load(open('pyproject.toml','rb')); import opensearch_orchestrator as pkg; print('pyproject=', p['project']['version'], 'package=', pkg.__version__)"
+
+          uv build
+          for whl in dist/*.whl; do python -m zipfile -l "$whl"; done
+          python -c "import opensearch_orchestrator.mcp_server as m; print(hasattr(m, 'main'))"
+
+          VERSION=`cat pyproject.toml | grep "version =" | grep -Eo "[0-9.]+"`
+          WHEEL_PATH="$(ls dist/opensearch_launchpad-${VERSION}-*.whl 2>/dev/null || ls dist/opensearch_orchestrator-${VERSION}-*.whl)"
+          uvx --from "$WHEEL_PATH" opensearch-launchpad
+
+          mkdir -p release-wheel
+          cp -v $WHEEL_PATH release-wheel/
+          wheel_name=`ls release-wheel/`
+          echo "WHEEL_NAME=$wheel_name" >> $GITHUB_ENV
+      - name: Publish python artifacts to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Draft a release
+        uses: softprops/action-gh-release@v1
+        with:
+          draft: false
+          generate_release_notes: true
+          files: release-wheel/${{ env.WHEEL_NAME }}
