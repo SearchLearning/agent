@@ -263,6 +263,20 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 - If `execute_plan()` returns manual execution bootstrap payload, follow it and then call `set_execution_from_execution_report(worker_response, execution_context)` to persist normalized execution state.
 - If execution fails, the user can fix the issue (e.g., restart Docker) and call `retry_execution()`.
 
+### Phase 4.5: Evaluate Search Quality (optional)
+- After successful Phase 4 execution, offer to evaluate search quality before deploying to AWS.
+- Ask the user: *"Would you like to evaluate the search quality? I can analyze relevance, coverage, and capability gaps, and suggest improvements."*
+- If the user agrees, call `start_evaluation()`.
+- If `start_evaluation()` returns `manual_evaluation_required=true`, act as the evaluator using the returned prompt and call `set_evaluation_from_evaluation_complete(evaluator_response)` with the result.
+- Present the evaluation findings to the user, including:
+  - `search_quality_summary`: overall quality narrative
+  - `issues`: identified problems or gaps
+  - `suggested_preferences`: recommended `set_preferences` arguments for a fresh iteration
+- If `suggested_preferences` is non-empty, offer to start over with the new preferences:
+  *"Based on the evaluation, I suggest restarting with updated preferences to improve search quality. Would you like to try again?"*
+- If the user agrees to restart, go back to Phase 1 (`load_sample`) and apply the suggested preferences automatically in Phase 2.
+- If the user declines evaluation or declines to restart, proceed to Phase 5.
+
 ### Phase 5: Deploy to AWS OpenSearch (optional)
 - After successful local execution, offer to deploy the search strategy to AWS OpenSearch.
 - **Important**: Before starting Phase 5, guide the user to add AWS MCP servers to the power's mcp.json configuration (see AWS Setup in Onboarding section). Verify the servers are configured before proceeding.
@@ -304,6 +318,8 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 | `execute_plan` | 4 | Execute the plan (create index, models, pipelines, UI) |
 | `set_execution_from_execution_report` | 4 | Parse/store finalized worker output for manual execution mode |
 | `retry_execution` | 4 | Resume from a failed execution step |
+| `start_evaluation` | 4.5 | Evaluate search quality; may return `manual_evaluation_required` with evaluator prompt |
+| `set_evaluation_from_evaluation_complete` | 4.5 | Parse/store evaluator output for manual evaluation mode |
 | `prepare_aws_deployment` | 5 | Get deployment target, local config, steering file list, and state template for AWS deployment |
 | `connect_search_ui_to_endpoint` | 5 | Switch Search UI to query an AWS OpenSearch endpoint after deployment |
 | `cleanup` | Post | Remove test documents on user request |
@@ -324,6 +340,8 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 - Show the planner's proposal text to the user verbatim; do not summarize it away.
 - For preference questions, ask one question per turn and use user-input UI fixed options. Accept either a number or free-text answer.
 - Do not ask redundant clarification questions for items already inferred from the sample data.
+- Phase 4.5 (evaluation) is optional and should only be offered after successful Phase 4 execution. Always proactively mention it is available.
+- If evaluation suggests new preferences, offer to restart from Phase 1 with those preferences pre-applied.
 - Phase 5 (AWS deployment) is optional and should only be offered after successful Phase 4 execution.
 
 ## Prerequisites

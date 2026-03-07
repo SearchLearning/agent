@@ -50,6 +50,7 @@ class OrchestratorEngine:
         self.phase = Phase.COLLECT_SAMPLE
         self.planning = None
         self.plan_result: dict | None = None
+        self.evaluation_result: dict | None = None
 
         self._clear_sample_state = clear_sample_state
         self._reset_state = reset_state
@@ -142,6 +143,7 @@ class OrchestratorEngine:
         self.phase = Phase.COLLECT_SAMPLE
         self.planning = None
         self.plan_result = None
+        self.evaluation_result = None
 
     def load_sample(
         self,
@@ -423,8 +425,42 @@ class OrchestratorEngine:
             "result": self.plan_result,
         }
 
-    async def retry_execution(
+    def set_evaluation(
         self,
+        *,
+        search_quality_summary: str,
+        issues: str = "",
+        suggested_preferences: dict | None = None,
+    ) -> dict:
+        """Store a finalized evaluation result.
+
+        Args:
+            search_quality_summary: Human-readable summary of search quality findings.
+            issues: Identified issues or gaps in the current setup.
+            suggested_preferences: Optional dict of recommended set_preferences args
+                (budget, performance, query_pattern, deployment_preference) for a restart.
+
+        Returns:
+            dict with status and stored evaluation result.
+        """
+        if self.plan_result is None:
+            return {"error": "No finalized plan available. Complete the planning and execution phases first."}
+
+        clean_summary = str(search_quality_summary or "").strip()
+        if not clean_summary:
+            return {"error": "search_quality_summary is required and cannot be empty."}
+
+        self.evaluation_result = {
+            "search_quality_summary": clean_summary,
+            "issues": str(issues or "").strip(),
+            "suggested_preferences": dict(suggested_preferences) if isinstance(suggested_preferences, dict) else {},
+        }
+        return {
+            "status": "Evaluation stored.",
+            "result": self.evaluation_result,
+        }
+
+    async def retry_execution(        self,
         *,
         worker_executor: Any = None,
         worker_executor_async: Any = None,

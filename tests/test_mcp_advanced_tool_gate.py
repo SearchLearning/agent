@@ -47,10 +47,12 @@ def test_default_tool_surface_is_workflow_only() -> None:
         "refine_plan",
         "retry_execution",
         "search_opensearch_org",
+        "set_evaluation_from_evaluation_complete",
         "set_execution_from_execution_report",
         "set_plan_from_planning_complete",
         "set_preferences",
         "set_search_ui_suggestions",
+        "start_evaluation",
         "start_planning",
         "talk_to_client_llm",
     }

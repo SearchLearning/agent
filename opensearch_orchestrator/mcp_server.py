@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 
 from opensearch_orchestrator.orchestrator import create_transport_agnostic_engine
 from opensearch_orchestrator.planning_session import PlanningSession
-from opensearch_orchestrator.shared import Phase
+from opensearch_orchestrator.shared import Phase, get_last_worker_run_state
 from opensearch_orchestrator.solution_planning_assistant import (
     SYSTEM_PROMPT as PLANNER_SYSTEM_PROMPT,
 )
@@ -154,6 +154,25 @@ Use the opensearch-launchpad MCP tools to guide the user from requirements to a 
   how to access the UI using the returned `ui_access` URLs.
 - `cleanup()` removes test/verification documents when the user explicitly asks.
 
+### Optional: Evaluate Search Quality (Phase 4.5)
+- After Phase 4 completes, ask the user if they want to evaluate search quality.
+- If yes, call `start_evaluation()` to begin the evaluation process.
+  - If `start_evaluation()` returns `manual_evaluation_required=true`, follow the returned
+    evaluation bootstrap payload and call `set_evaluation_from_evaluation_complete(...)`
+    once the evaluation is complete.
+  - Otherwise, present the evaluation findings verbatim to the user.
+- The evaluation result includes:
+  - `search_quality_summary`: overall quality assessment
+  - `issues`: identified gaps or problems
+  - `suggested_preferences`: recommended `set_preferences` args for a fresh start
+- After showing the evaluation, ask the user if they want to start over with the suggested preferences.
+  - If yes, call `set_preferences(...)` with the suggested values and restart from Phase 3 (planning).
+  - If no, continue to Phase 5 (AWS deployment) or stop.
+
+### Optional: Deploy to AWS (Phase 5)
+- After Phase 4 completes (and optionally Phase 4.5), ask the user if they want to deploy to AWS.
+- Call `prepare_aws_deployment()` to get deployment target, steering files, and required MCP servers.
+
 ## Rules
 - Never skip Phase 1. A sample document is mandatory before planning.
 - Prefer planner tools for plan generation.
@@ -164,6 +183,8 @@ Use the opensearch-launchpad MCP tools to guide the user from requirements to a 
 - Show the planner's proposal text to the user verbatim; do not summarize it away.
 - For preference questions, ask one question per turn and use user-input UI fixed options, not free-text.
 - Do not ask redundant clarification questions for items already inferred from the sample data.
+- Evaluation (Phase 4.5) is optional. Only start it when the user explicitly agrees.
+- If evaluation returns `suggested_preferences`, present them clearly and ask the user if they want to restart with those preferences. Do not restart automatically.
 """
 
 # -------------------------------------------------------------------------
@@ -171,6 +192,9 @@ Use the opensearch-launchpad MCP tools to guide the user from requirements to a 
 # -------------------------------------------------------------------------
 
 _engine = create_transport_agnostic_engine()
+
+# Stores the last suggestion_meta from apply_capability_driven_verification for use in evaluation.
+_last_verification_suggestion_meta: list[dict] = []
 
 # -------------------------------------------------------------------------
 # MCP server
@@ -206,6 +230,23 @@ _CAPABILITIES_PATTERN = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 _KEYNOTE_PATTERN = re.compile(r"<keynote>(.*?)</keynote>", re.DOTALL | re.IGNORECASE)
+_EVALUATION_COMPLETE_PATTERN = re.compile(
+    r"<evaluation_complete>(.*?)</evaluation_complete>",
+    re.DOTALL | re.IGNORECASE,
+)
+_QUALITY_SUMMARY_PATTERN = re.compile(
+    r"<search_quality_summary>(.*?)</search_quality_summary>",
+    re.DOTALL | re.IGNORECASE,
+)
+_RELEVANCE_PATTERN = re.compile(r"<relevance>(.*?)</relevance>", re.DOTALL | re.IGNORECASE)
+_QUERY_COVERAGE_PATTERN = re.compile(r"<query_coverage>(.*?)</query_coverage>", re.DOTALL | re.IGNORECASE)
+_RANKING_QUALITY_PATTERN = re.compile(r"<ranking_quality>(.*?)</ranking_quality>", re.DOTALL | re.IGNORECASE)
+_CAPABILITY_GAP_PATTERN = re.compile(r"<capability_gap>(.*?)</capability_gap>", re.DOTALL | re.IGNORECASE)
+_ISSUES_PATTERN = re.compile(r"<issues>(.*?)</issues>", re.DOTALL | re.IGNORECASE)
+_SUGGESTED_PREFERENCES_PATTERN = re.compile(
+    r"<suggested_preferences>(.*?)</suggested_preferences>",
+    re.DOTALL | re.IGNORECASE,
+)
 _OPENSEARCH_AUTH_MODE_ENV = "OPENSEARCH_AUTH_MODE"
 _OPENSEARCH_USER_ENV = "OPENSEARCH_USER"
 _OPENSEARCH_PASSWORD_ENV = "OPENSEARCH_PASSWORD"
@@ -330,11 +371,18 @@ def _build_persistable_engine_payload() -> dict[str, object]:
         if isinstance(plan_result, dict)
         else None
     )
+    evaluation_result = getattr(_engine, "evaluation_result", None)
+    normalized_evaluation_result = (
+        dict(evaluation_result)
+        if isinstance(evaluation_result, dict)
+        else None
+    )
     return {
         "version": _MCP_STATE_VERSION,
         "phase": phase_name,
         "state": state_payload,
         "plan_result": normalized_plan_result,
+        "evaluation_result": normalized_evaluation_result,
     }
 
 
@@ -398,6 +446,13 @@ def _restore_engine_state_from_file() -> None:
     if isinstance(plan_result, dict):
         try:
             _engine.plan_result = dict(plan_result)
+        except Exception:
+            pass
+
+    evaluation_result = payload.get("evaluation_result")
+    if isinstance(evaluation_result, dict):
+        try:
+            _engine.evaluation_result = dict(evaluation_result)
         except Exception:
             pass
 
@@ -1199,6 +1254,9 @@ async def execute_plan(additional_context: str = "") -> dict:
 
     Args:
         additional_context: Optional extra instructions for the worker.
+            Can include a "Hybrid Weight Profile: lexical-heavy|balanced|semantic-heavy" line
+            to override the hybrid search pipeline weights derived from the plan.
+            lexical-heavy => [0.8, 0.2], balanced => [0.5, 0.5], semantic-heavy => [0.2, 0.8].
 
     Returns:
         dict with manual execution payload for client LLM worker turns.
@@ -1438,6 +1496,7 @@ async def apply_capability_driven_verification(
     ctx: Context | None = None,
 ) -> dict[str, object]:
     """Apply capability-driven verification and MCP semantic-query rewrite via client LLM."""
+    global _last_verification_suggestion_meta
     (
         resolved_sample_doc_json,
         resolved_source_local_file,
@@ -1459,7 +1518,12 @@ async def apply_capability_driven_verification(
             existing_verification_doc_ids=existing_verification_doc_ids,
         )
     # write semantic query
-    return await _rewrite_semantic_suggestion_entries_with_client_llm(result=result, ctx=ctx)
+    result = await _rewrite_semantic_suggestion_entries_with_client_llm(result=result, ctx=ctx)
+    # persist for evaluation phase
+    meta = result.get("suggestion_meta", [])
+    if isinstance(meta, list) and meta:
+        _last_verification_suggestion_meta = list(meta)
+    return result
 
 
 @mcp.tool()
@@ -1513,6 +1577,314 @@ def connect_search_ui_to_endpoint(
         index_name=index_name,
     )
 
+
+
+def _parse_evaluation_complete_response(response_text: str) -> dict[str, object]:
+    """Extract fields from an <evaluation_complete> block."""
+    text = str(response_text or "")
+    match = _EVALUATION_COMPLETE_PATTERN.search(text)
+    if match is None:
+        return {
+            "error": "No <evaluation_complete> block found.",
+            "details": [
+                "Provide the evaluator output containing <evaluation_complete>...</evaluation_complete>.",
+            ],
+        }
+    content = match.group(1)
+    summary_match = _QUALITY_SUMMARY_PATTERN.search(content)
+    relevance_match = _RELEVANCE_PATTERN.search(content)
+    query_coverage_match = _QUERY_COVERAGE_PATTERN.search(content)
+    ranking_quality_match = _RANKING_QUALITY_PATTERN.search(content)
+    capability_gap_match = _CAPABILITY_GAP_PATTERN.search(content)
+    issues_match = _ISSUES_PATTERN.search(content)
+    prefs_match = _SUGGESTED_PREFERENCES_PATTERN.search(content)
+
+    # Support both legacy <search_quality_summary> and new structured dimensions.
+    # If new dimensions are present, build summary from them; otherwise fall back to legacy.
+    relevance = relevance_match.group(1).strip() if relevance_match else ""
+    query_coverage = query_coverage_match.group(1).strip() if query_coverage_match else ""
+    ranking_quality = ranking_quality_match.group(1).strip() if ranking_quality_match else ""
+    capability_gap = capability_gap_match.group(1).strip() if capability_gap_match else ""
+
+    if relevance or query_coverage or ranking_quality or capability_gap:
+        summary = "\n".join(filter(None, [relevance, query_coverage, ranking_quality, capability_gap]))
+    else:
+        summary = summary_match.group(1).strip() if summary_match else ""
+
+    if not summary:
+        return {
+            "error": "Invalid <evaluation_complete> block.",
+            "details": ["At least one score dimension is required."],
+        }
+
+    issues = issues_match.group(1).strip() if issues_match else ""
+    suggested_preferences: dict[str, str] = {}
+    if prefs_match:
+        raw_prefs = prefs_match.group(1).strip()
+        # Strip any explanatory text before the JSON object
+        json_start = raw_prefs.find("{")
+        json_end = raw_prefs.rfind("}") + 1
+        if json_start != -1 and json_end > json_start:
+            raw_prefs = raw_prefs[json_start:json_end]
+        try:
+            parsed = json.loads(raw_prefs)
+            if isinstance(parsed, dict):
+                suggested_preferences = {str(k): str(v) for k, v in parsed.items()}
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    result: dict[str, object] = {
+        "search_quality_summary": summary,
+        "issues": issues,
+        "suggested_preferences": suggested_preferences,
+    }
+    if relevance:
+        result["relevance"] = relevance
+    if query_coverage:
+        result["query_coverage"] = query_coverage
+    if ranking_quality:
+        result["ranking_quality"] = ranking_quality
+    if capability_gap:
+        result["capability_gap"] = capability_gap
+    return result
+
+
+def _extract_index_name_from_worker_context(context: str) -> str:
+    """Best-effort extraction of the target index name from a worker execution context."""
+    # Pattern: create_index(index_name="my-index", ...) or index_name: "my-index"
+    for pattern in (
+        r'create_index\s*\(\s*["\']?index_name["\']?\s*[=:]\s*["\']([^"\']+)["\']',
+        r'"index_name"\s*:\s*"([^"]+)"',
+        r"index_name\s*[=:]\s*['\"]([^'\"]+)['\"]",
+        r"index[:\s]+([a-z][a-z0-9_\-]{2,})",
+    ):
+        m = re.search(pattern, context, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip()
+            # Reject obvious non-index tokens
+            if candidate and not candidate.startswith(".") and len(candidate) > 2:
+                return candidate
+    return ""
+
+
+def _build_evaluation_prompt() -> str:
+    """Build the evaluator prompt focused on relevance and user satisfaction."""
+    plan = _engine.plan_result or {}
+    solution = str(plan.get("solution", "")).strip()
+    capabilities = str(plan.get("search_capabilities", "")).strip()
+
+    # Pull index_name from the stored worker execution context.
+    worker_state = get_last_worker_run_state()
+    worker_context = str(worker_state.get("context", "")).strip() if isinstance(worker_state, dict) else ""
+    index_name = _extract_index_name_from_worker_context(worker_context)
+
+    # Pull suggestion_meta captured during apply_capability_driven_verification.
+    suggestion_meta = list(_last_verification_suggestion_meta)
+
+    # Build evidence block from verification queries.
+    evidence_lines: list[str] = []
+    if index_name:
+        evidence_lines.append(f"Index: {index_name}")
+    for entry in suggestion_meta:
+        if not isinstance(entry, dict):
+            continue
+        cap = str(entry.get("capability", "")).strip()
+        text = str(entry.get("text", "")).strip()
+        if cap and text:
+            evidence_lines.append(f"  - [{cap}] {text}")
+
+    evidence_block = (
+        "\n\n## Verification Queries\n" + "\n".join(evidence_lines)
+        if evidence_lines else
+        "\n\n(No verification data — findings will be architectural estimates.)"
+    )
+
+    return (
+        "You are an OpenSearch search quality evaluator.\n"
+        "Focus on **relevance** and **user satisfaction** only.\n\n"
+        f"## Plan\n{solution}\n\n"
+        f"## Search Capabilities\n{capabilities}"
+        f"{evidence_block}\n\n"
+        "## Scoring Instructions\n"
+        "Score each dimension honestly from 1–5 based on the plan and verification queries above.\n"
+        "Do NOT default to high scores. A score of 5 means the setup is genuinely excellent for that dimension.\n"
+        "A score of 3 means it works but has clear gaps. A score of 1–2 means it will frustrate users.\n\n"
+        "Scoring rubric per dimension:\n\n"
+        "**Relevance** — do top results match what the user actually meant?\n"
+        "  5: retrieval method matches all query types in the plan (exact, semantic, fuzzy as applicable)\n"
+        "  4: matches most query types; minor gaps in edge cases\n"
+        "  3: handles navigational/exact queries but misses intent-based or concept queries\n"
+        "  2: only works for very precise keyword matches; synonyms and paraphrases fail\n"
+        "  1: results are largely irrelevant or arbitrary\n\n"
+        "**Query Coverage** — what fraction of query types are actually handled?\n"
+        "  5: all declared capabilities (exact, semantic, structured, fuzzy, combined) are fully supported\n"
+        "  4: most capabilities supported; one minor gap\n"
+        "  3: exact and structured work; semantic or fuzzy missing or weak\n"
+        "  2: only one or two query types work reliably\n"
+        "  1: coverage is minimal or broken\n\n"
+        "**Ranking Quality** — are the right documents surfacing at the top?\n"
+        "  5: scoring is meaningful; exact matches rank above partial matches; filters don't pollute scores\n"
+        "  4: generally good ranking; minor score pollution from structured filters\n"
+        "  3: ranking works for simple cases but structured filters or fuzzy candidates distort scores\n"
+        "  2: ranking is largely arbitrary; BM25 TF-IDF scores dominate even for filter-heavy queries\n"
+        "  1: top results are not the most relevant documents\n\n"
+        "**Capability Gap** — what important search patterns are completely unsupported?\n"
+        "  5: no meaningful gaps given the use case\n"
+        "  4: minor gap (e.g. no autocomplete) that doesn't affect core use case\n"
+        "  3: one significant gap (e.g. no semantic retrieval for a mixed query workload)\n"
+        "  2: multiple gaps that will frustrate users regularly\n"
+        "  1: the retrieval method is fundamentally mismatched to the use case\n\n"
+        "## Issues and Suggestions\n"
+        "For each issue found, be specific and actionable:\n"
+        "- Name the dimension it affects\n"
+        "- Describe exactly what will fail for the user\n"
+        "- Recommend a concrete fix from this list (use whichever apply):\n"
+        "    * Switch retrieval method (e.g. BM25 → Hybrid, Hybrid → Dense Vector)\n"
+        "    * Adjust hybrid weights (e.g. shift lexical-heavy 0.8/0.2 → balanced 0.5/0.5 for more semantic coverage)\n"
+        "    * Change embedding model (e.g. swap sparse for dense, or upgrade to a higher-quality model)\n"
+        "    * Add or remove sparse encoding (e.g. add neural sparse pipeline for concept queries)\n"
+        "    * Tune BM25 parameters (e.g. boost primaryTitle field, move filters to bool.filter to avoid score pollution)\n"
+        "    * Add query boosting (e.g. multi_match with field boosts to promote exact title matches)\n"
+        "    * Other pipeline or mapping changes that would directly improve the failing query type\n"
+        "If a different retrieval strategy would score meaningfully higher, say so explicitly and set "
+        "suggested_preferences accordingly. Only suggest a restart if the improvement would be significant.\n\n"
+        "Output inside <evaluation_complete> using these exact tags.\n"
+        "Each dimension MUST be on its own line inside its tag.\n"
+        "Use this exact score format: [N/5] where N is the integer score (e.g. [4/5]).\n"
+        "Follow the score with a dash and a concise one-sentence finding.\n\n"
+        "Required output format (replace placeholder text and scores with your actual findings):\n\n"
+        "<evaluation_complete>\n"
+        "<relevance>\n"
+        "Relevance: [<n>/5] - <your relevance finding here>\n"
+        "</relevance>\n"
+        "<query_coverage>\n"
+        "Query Coverage: [<n>/5] - <your query coverage finding here>\n"
+        "</query_coverage>\n"
+        "<ranking_quality>\n"
+        "Ranking Quality: [<n>/5] - <your ranking quality finding here>\n"
+        "</ranking_quality>\n"
+        "<capability_gap>\n"
+        "Capability Gap: [<n>/5] - <your capability gap finding here>\n"
+        "</capability_gap>\n"
+        "<issues>\n"
+        "- [<Dimension>] <issue description and recommended fix>\n"
+        "</issues>\n"
+        "<suggested_preferences>\n"
+        "If any issue would be significantly improved by changing user preferences, populate this JSON object.\n"
+        "Use only valid keys: query_pattern, performance, budget, deployment_preference.\n"
+        "Valid values: query_pattern: mostly-exact|balanced|mostly-semantic, "
+        "performance: speed-first|balanced|accuracy-first, budget: flexible|cost-sensitive, "
+        "deployment_preference: opensearch-node|sagemaker-endpoint|external-embedding-api.\n"
+        "Only include keys where a change would meaningfully improve relevancy. "
+        "If no preference change would help, use {}.\n"
+        "Example: {\"query_pattern\": \"balanced\", \"performance\": \"accuracy-first\"}\n"
+        "</suggested_preferences>\n"
+        "</evaluation_complete>"
+    )
+
+
+@mcp.tool()
+async def start_evaluation(ctx: Context | None = None) -> dict:
+    """Start the optional search quality evaluation phase.
+    Call after successful Phase 4 execution, only when the user agrees to evaluate.
+
+    Automatically uses the index name from the last execution and the verification
+    queries captured by apply_capability_driven_verification for evidence-based scoring.
+
+    Returns:
+        dict with evaluation findings (search_quality_summary, issues, suggested_preferences),
+        or a manual fallback payload when client sampling is unavailable.
+    """
+    if _engine.plan_result is None:
+        return {"error": "No finalized plan available. Complete Phase 4 first."}
+
+    evaluation_prompt = _build_evaluation_prompt()
+
+    if ctx is None:
+        return {
+            "error": "Evaluation failed in client mode.",
+            "details": ["MCP context is unavailable for client sampling."],
+            "manual_evaluation_required": True,
+            "hint": (
+                "Use the returned evaluation_prompt with the client LLM, then call "
+                "`set_evaluation_from_evaluation_complete(evaluator_response)` with the result."
+            ),
+            "evaluation_prompt": evaluation_prompt,
+        }
+
+    try:
+        sampling_result = await ctx.session.create_message(
+            messages=[
+                mcp_types.SamplingMessage(
+                    role="user",
+                    content=mcp_types.TextContent(type="text", text=evaluation_prompt),
+                )
+            ],
+            max_tokens=4000,
+            system_prompt=(
+                "You are an OpenSearch search quality evaluator. "
+                "Output your findings inside an <evaluation_complete> block."
+            ),
+        )
+        response_text = _sampling_content_to_text(sampling_result.content)
+        parsed = _parse_evaluation_complete_response(response_text)
+        if "error" in parsed:
+            return {**parsed, "raw_response": response_text}
+
+        result = _engine.set_evaluation(
+            search_quality_summary=str(parsed.get("search_quality_summary", "")),
+            issues=str(parsed.get("issues", "")),
+            suggested_preferences=parsed.get("suggested_preferences"),  # type: ignore[arg-type]
+        )
+        _persist_engine_state("start_evaluation")
+        result["evaluation_backend"] = "client_sampling"
+        return result
+
+    except Exception as exc:
+        if _is_method_not_found_error(exc):
+            return {
+                "error": "Evaluation failed in client mode.",
+                "details": [f"client-sampling evaluator failed: {exc}"],
+                "manual_evaluation_required": True,
+                "hint": (
+                    "The MCP client does not support `sampling/createMessage`. "
+                    "Use the returned evaluation_prompt with the client LLM, then call "
+                    "`set_evaluation_from_evaluation_complete(evaluator_response)` with the result."
+                ),
+                "evaluation_prompt": evaluation_prompt,
+            }
+        return {
+            "error": "Evaluation failed in client mode.",
+            "details": [f"client-sampling evaluator failed: {exc}"],
+        }
+
+
+@mcp.tool()
+def set_evaluation_from_evaluation_complete(evaluator_response: str) -> dict:
+    """Parse and store evaluator output from an <evaluation_complete> block.
+    Use this when `start_evaluation` returns `manual_evaluation_required=true`.
+
+    Args:
+        evaluator_response: Full evaluator response text containing <evaluation_complete>.
+
+    Returns:
+        dict with status and stored evaluation result, or error details.
+    """
+    parsed = _parse_evaluation_complete_response(evaluator_response)
+    if "error" in parsed:
+        return parsed
+
+    result = _engine.set_evaluation(
+        search_quality_summary=str(parsed.get("search_quality_summary", "")),
+        issues=str(parsed.get("issues", "")),
+        suggested_preferences=parsed.get("suggested_preferences"),  # type: ignore[arg-type]
+    )
+    _persist_engine_state("set_evaluation_from_evaluation_complete")
+    # Surface structured dimensions if present.
+    for dim in ("relevance", "query_coverage", "ranking_quality", "capability_gap"):
+        if dim in parsed:
+            result.setdefault("result", {})[dim] = parsed[dim]  # type: ignore[index]
+    return result
 
 
 @mcp.tool()
