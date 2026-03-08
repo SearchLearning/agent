@@ -1487,7 +1487,7 @@ def create_agentic_search_pipeline(
 async def apply_capability_driven_verification(
     worker_output: str,
     index_name: str = "",
-    count: int = 10,
+    count: int = 20,
     id_prefix: str = "verification",
     sample_doc_json: str = "",
     source_local_file: str = "",

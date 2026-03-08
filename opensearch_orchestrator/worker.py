@@ -724,7 +724,7 @@ def build_worker_initial_input(
         "Please implement this plan.\n"
         "Capability alignment step (must run after pipeline setup and before verification docs):\n"
         "- Call apply_capability_driven_verification with worker_output set to the full approved plan text above and explicit index_name for this run.\n"
-        "- This call also indexes capability-selected verification docs (count=10 by default).\n"
+        "- This call also indexes capability-selected verification docs (count=20 by default).\n"
         "- Do not omit index_name in that call.\n"
         "- The result contains a 'suggestion_meta' list. Pass it as JSON to set_search_ui_suggestions(index_name, suggestion_meta_json) before launching the UI.\n"
         "- Continue even if capability coverage is partial; capture any notes in your final report.\n"
@@ -963,7 +963,7 @@ def _run_worker_once(context: str) -> str:
     def apply_capability_driven_verification(
         worker_output: str,
         index_name: str = "",
-        count: int = 10,
+        count: int = 20,
         id_prefix: str = "verification",
         sample_doc_json: str = "",
         source_local_file: str = "",

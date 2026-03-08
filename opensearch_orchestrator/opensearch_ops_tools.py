@@ -2942,7 +2942,7 @@ def _find_suggestion_meta(index_name: str, query_text: str) -> dict[str, object]
 
 def _evaluate_capability_driven_selection(
     worker_output: str,
-    count: int = 10,
+    count: int = 20,
     sample_doc_json: str = "",
     source_local_file: str = "",
     source_index_name: str = "",
@@ -3068,7 +3068,7 @@ def _evaluate_capability_driven_selection(
 
 def preview_cap_driven_verification(
     worker_output: str,
-    count: int = 10,
+    count: int = 20,
     sample_doc_json: str = "",
     source_local_file: str = "",
     source_index_name: str = "",
@@ -3095,7 +3095,7 @@ def preview_cap_driven_verification(
 def apply_capability_driven_verification(
     worker_output: str,
     index_name: str = "",
-    count: int = 10,
+    count: int = 20,
     id_prefix: str = "verification",
     sample_doc_json: str = "",
     source_local_file: str = "",
@@ -3176,14 +3176,26 @@ def apply_capability_driven_verification(
 
     indexed_ids: list[str] = []
     index_errors: list[str] = []
+    bulk_body: list[dict] = []
+    doc_id_list: list[str] = []
     for offset, doc_idx in enumerate(selected_indexes_for_indexing, start=1):
         doc_id = f"{id_prefix}-{offset}"
         doc_source = features_list[doc_idx]["source"]
+        bulk_body.append({"index": {"_index": target_index, "_id": doc_id}})
+        bulk_body.append(doc_source)
+        doc_id_list.append(doc_id)
+
+    if bulk_body:
         try:
-            opensearch_client.index(index=target_index, body=doc_source, id=doc_id)
-            indexed_ids.append(doc_id)
+            resp = opensearch_client.bulk(body=bulk_body)
+            for item, doc_id in zip(resp.get("items", []), doc_id_list):
+                action_result = item.get("index", {})
+                if action_result.get("error"):
+                    index_errors.append(f"{doc_id}: {action_result['error']}")
+                else:
+                    indexed_ids.append(doc_id)
         except Exception as e:
-            index_errors.append(f"{doc_id}: {e}")
+            index_errors.append(f"bulk request failed: {e}")
 
     if indexed_ids:
         opensearch_client.indices.refresh(index=target_index)
@@ -5619,7 +5631,7 @@ def index_doc(index_name: str, doc: dict, doc_id: str) -> str:
 
 def index_verification_docs(
     index_name: str,
-    count: int = 10,
+    count: int = 20,
     id_prefix: str = "verification",
     sample_doc_json: str = "",
     source_local_file: str = "",
@@ -5629,7 +5641,7 @@ def index_verification_docs(
 
     Args:
         index_name: Target index name.
-        count: Number of docs to index (default 10, max 100).
+        count: Number of docs to index (default 20, max 100).
         id_prefix: Prefix for generated doc IDs.
         sample_doc_json: JSON string of a single sample document.
         source_local_file: Path to the local file the sample was loaded from.
@@ -5654,14 +5666,26 @@ def index_verification_docs(
     opensearch_client = _create_client()
     indexed_ids: list[str] = []
     errors: list[str] = []
+    bulk_body: list[dict] = []
+    doc_id_list: list[str] = []
 
     for i, doc in enumerate(docs, start=1):
         doc_id = f"{id_prefix}-{i}"
+        bulk_body.append({"index": {"_index": index_name, "_id": doc_id}})
+        bulk_body.append(doc)
+        doc_id_list.append(doc_id)
+
+    if bulk_body:
         try:
-            opensearch_client.index(index=index_name, body=doc, id=doc_id)
-            indexed_ids.append(doc_id)
+            resp = opensearch_client.bulk(body=bulk_body)
+            for item, doc_id in zip(resp.get("items", []), doc_id_list):
+                action_result = item.get("index", {})
+                if action_result.get("error"):
+                    errors.append(f"{doc_id}: {action_result['error']}")
+                else:
+                    indexed_ids.append(doc_id)
         except Exception as e:
-            errors.append(f"{doc_id}: {e}")
+            errors.append(f"bulk request failed: {e}")
 
     if indexed_ids:
         opensearch_client.indices.refresh(index=index_name)

@@ -27,6 +27,18 @@ class _FakeClient:
     def index(self, index, body, id):
         self.indexed.append((index, id, body))
 
+    def bulk(self, body):
+        items = []
+        i = 0
+        while i < len(body):
+            action = body[i]
+            doc = body[i + 1]
+            meta = action.get("index", {})
+            self.indexed.append((meta.get("_index"), meta.get("_id"), doc))
+            items.append({"index": {"_id": meta.get("_id"), "result": "created", "status": 201}})
+            i += 2
+        return {"errors": False, "items": items}
+
     def delete(self, index, id, ignore=None):
         self.deleted.append((index, id, tuple(ignore or [])))
 
