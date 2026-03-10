@@ -839,13 +839,61 @@ def _build_ui_access_payload() -> dict[str, object]:
     public_host = "localhost" if SEARCH_UI_HOST in {"0.0.0.0", "::"} else SEARCH_UI_HOST
     urls: list[str] = []
     for host in (public_host, "127.0.0.1", "localhost"):
-        url = f"http://{host}:{SEARCH_UI_PORT}"
+        url = f"http://{host}:{SEARCH_UI_PORT}/interactive.html"
         if url not in urls:
             urls.append(url)
     return {
         "primary_url": urls[0],
         "alternate_urls": urls[1:],
+        "fallback_url": f"http://{public_host}:{SEARCH_UI_PORT}",
     }
+
+
+def _launch_interactive_ui_background() -> None:
+    """Start the WebSocket server (if not running) and the HTTP UI server in the background.
+    Safe to call multiple times — no-ops if already running."""
+    import socket
+    import subprocess
+    import shutil
+    import time
+    from pathlib import Path
+
+    ws_host = "127.0.0.1"
+    ws_port = 8766
+
+    def _ws_running() -> bool:
+        try:
+            with socket.create_connection((ws_host, ws_port), timeout=1):
+                return True
+        except OSError:
+            return False
+
+    if not _ws_running():
+        uv_bin = shutil.which("uv") or "uv"
+        project_root = str(Path(__file__).resolve().parents[1])
+        try:
+            subprocess.Popen(
+                [uv_bin, "run", "--project", project_root,
+                 "python", "-m", "opensearch_orchestrator.websocket_server_standalone"],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+            )
+            # Give it a moment to bind
+            for _ in range(12):
+                time.sleep(0.25)
+                if _ws_running():
+                    break
+        except Exception:
+            pass  # Non-fatal — frontend will fall back to standalone UI
+
+    # Ensure HTTP UI server is running
+    try:
+        with _temporary_execution_auth_env():
+            launch_search_ui_impl()
+    except Exception:
+        pass
 
 
 def _build_manual_llm_payload(
@@ -1322,6 +1370,8 @@ def set_execution_from_execution_report(
     status = str(report.get("status", "")).strip().lower() if isinstance(report, dict) else ""
     _engine.phase = Phase.DONE if status == "success" else Phase.EXEC_FAILED
     _persist_engine_state("set_execution_from_execution_report")
+    if status == "success":
+        _launch_interactive_ui_background()
     return {
         "status": str(committed.get("status", "Execution report stored.")),
         "execution_report": report,
@@ -1903,6 +1953,87 @@ def prepare_aws_deployment() -> dict:
 
 
 @mcp.tool()
+def launch_interactive_ui() -> str:
+    """Launch the interactive search UI with real-time chat.
+    
+    Opens a browser window with a dynamic UI that includes:
+    - Search interface with live results
+    - Chat panel for conversing with the agent
+    - Real-time status updates
+    
+    The UI connects via WebSocket for bidirectional communication.
+    
+    Returns:
+        str: URL and instructions for accessing the interactive UI.
+    """
+    import subprocess
+    import time
+    import socket
+    import shutil
+    import webbrowser
+    from pathlib import Path
+
+    ws_host = "localhost"
+    ws_port = 8766
+
+    # Check if WebSocket server is already running
+    def _ws_is_running() -> bool:
+        try:
+            with socket.create_connection((ws_host, ws_port), timeout=1):
+                return True
+        except OSError:
+            return False
+
+    if not _ws_is_running():
+        # Find uv on PATH to spawn with the correct venv
+        import shutil
+        uv_bin = shutil.which("uv") or "uv"
+        project_root = str(Path(__file__).resolve().parents[1])
+        subprocess.Popen(
+            [uv_bin, "run", "--project", project_root,
+             "python", "-m", "opensearch_orchestrator.websocket_server_standalone"],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+        )
+        # Wait up to 5s for it to become ready
+        for _ in range(20):
+            time.sleep(0.25)
+            if _ws_is_running():
+                break
+
+    # Also ensure the HTTP UI server is running
+    with _temporary_execution_auth_env():
+        launch_search_ui_impl()
+
+    url = f"http://{SEARCH_UI_HOST}:{SEARCH_UI_PORT}/interactive.html"
+
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+    ws_status = "running" if _ws_is_running() else "failed to start"
+    return f"""Interactive UI launched successfully!
+
+URL: {url}
+
+Features:
+- Search documents with live results
+- Chat with the agent in real-time
+- View current workflow phase
+- WebSocket connection for instant updates
+
+The UI is now open in your browser. You can:
+1. Search documents using the search box
+2. Chat with me using the chat panel on the right
+3. Monitor the connection status in the header
+
+Note: The WebSocket server is {ws_status} on ws://{ws_host}:{ws_port}"""
+
+
+@mcp.tool()
 def cleanup() -> str:
     """Remove verification/test documents from the OpenSearch index.
     Call only when the user explicitly asks for cleanup.
@@ -1995,12 +2126,7 @@ def main() -> None:
         )
         print("For an interactive local workflow, run: python opensearch_orchestrator/orchestrator.py")
         raise SystemExit(0)
-    # IDE MCP integrations commonly run stdio servers as child processes (for this repo:
-    # clients like Cursor launches `uv run opensearch_orchestrator/mcp_server.py` from `.cursor/mcp.json`).
-    # Reconnect-like events (window reload/restart, MCP toggle, cancel/disconnect/re-init)
-    # close and reopen the stdio pipe. When that pipe closes, this process should exit
-    # cleanly; the client starts a new process for the new connection.
-    # In practice: reconnect == restart (new PID, fresh in-memory session state).
+
     try:
         mcp.run(transport="stdio")
     except BaseException as exc:

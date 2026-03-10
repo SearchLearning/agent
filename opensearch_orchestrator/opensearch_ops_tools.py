@@ -4468,6 +4468,12 @@ def _resolve_search_ui_asset(path: str) -> Path | None:
     normalized = path.strip()
     if normalized in {"", "/"}:
         normalized = "/index.html"
+    elif normalized == "/interactive.html":
+        # Serve interactive UI
+        normalized = "/interactive.html"
+    elif normalized == "/interactive-app.jsx":
+        # Serve interactive app script
+        normalized = "/interactive-app.jsx"
 
     relative_path = normalized.lstrip("/")
     candidate = (SEARCH_UI_STATIC_DIR / relative_path).resolve()
