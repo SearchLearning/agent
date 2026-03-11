@@ -349,4 +349,23 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 - AWS credentials and MCP servers are required for Phase 5 (AWS deployment) - see AWS Setup section
 - See the [Onboarding](#onboarding) section for detailed setup instructions
 
-This power integrates with opensearch-launchpad (Apache-2.0 license).
+## Licenses
+
+This power integrates with the following MCP servers:
+
+- **opensearch-launchpad** (Apache-2.0 license) — core MCP server for the local workflow (Phases 1–4)
+- **awslabs.aws-api-mcp-server** (Apache-2.0 license) — optional, used in Phase 5 for AWS API operations
+- **awslabs.aws-documentation-mcp-server** (Apache-2.0 license) — optional, used in Phase 5 for AWS documentation lookups
+- **opensearch-mcp-server-py** (Apache-2.0 license) — optional, used in Phase 5 for direct OpenSearch cluster operations
+
+Steering files included in this power are original content licensed under Apache-2.0.
+
+## Telemetry
+
+This power does not collect, transmit, or store any client-side telemetry, analytics, or usage data. No data is sent to external services by the power itself.
+
+## Privacy
+
+- Session state (sample documents, preferences, auth mode) is persisted locally to `~/.opensearch_orchestrator/mcp_state.json` for session continuity across MCP reconnects. This file stays on your machine and is never transmitted externally. Passwords are not persisted to this file.
+- When using the `search_opensearch_org` tool, queries are sent to DuckDuckGo to search opensearch.org documentation.
+- When using `source_type="url"` in `load_sample`, the provided URL is fetched directly. No URLs are logged or stored beyond the local session state.
