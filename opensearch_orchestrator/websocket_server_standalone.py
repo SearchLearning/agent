@@ -3,7 +3,7 @@
 import asyncio
 import logging
 
-logging.basicConfig(level=logging.ERROR)
+logging.basicConfig(level=logging.INFO)
 
 
 def main() -> None:

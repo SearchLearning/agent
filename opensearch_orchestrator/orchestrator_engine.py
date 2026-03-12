@@ -312,6 +312,32 @@ class OrchestratorEngine:
             "context_notes": self._build_context_notes(state),
         }
 
+    def _build_evaluation_context(self) -> str:
+        """Build a planning context supplement from the previous evaluation result.
+
+        When the user restarts planning after an evaluation, this injects the
+        evaluation findings (quality summary, issues, and suggested changes)
+        so the planner can address them in the new architecture proposal.
+        """
+        ev = self.evaluation_result
+        if not isinstance(ev, dict):
+            return ""
+        parts: list[str] = []
+        parts.append(
+            "Previous evaluation findings (address these in the new plan):"
+        )
+        summary = str(ev.get("search_quality_summary", "")).strip()
+        if summary:
+            parts.append(f"Search quality summary:\n{summary}")
+        issues = str(ev.get("issues", "")).strip()
+        if issues:
+            parts.append(f"Identified issues:\n{issues}")
+        suggested = ev.get("suggested_preferences")
+        if isinstance(suggested, dict) and suggested:
+            pref_lines = ", ".join(f"{k}={v}" for k, v in suggested.items())
+            parts.append(f"Suggested preference changes: {pref_lines}")
+        return "\n".join(parts) if len(parts) > 1 else ""
+
     async def start_planning(
         self,
         *,
@@ -321,6 +347,13 @@ class OrchestratorEngine:
         state = self.state
         if state.sample_doc_json is None:
             return {"error": "No sample loaded. Call load_sample first."}
+
+        # Inject previous evaluation findings so the planner can address them.
+        eval_ctx = self._build_evaluation_context()
+        if eval_ctx:
+            additional_context = (
+                f"{eval_ctx}\n\n{additional_context}" if additional_context else eval_ctx
+            )
 
         context = self._build_planning_context(state, additional_context)
         self.plan_result = None

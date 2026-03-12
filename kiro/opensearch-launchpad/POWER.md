@@ -266,20 +266,40 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 ### Phase 4.5: Evaluate Search Quality (optional)
 - After successful Phase 4 execution, offer to evaluate search quality before deploying to AWS.
 - Ask the user: *"Would you like to evaluate the search quality? I can analyze relevance, coverage, and capability gaps, and suggest improvements."*
-- If the user agrees, call `start_evaluation()`.
-- If `start_evaluation()` returns `manual_evaluation_required=true`, act as the evaluator using the returned prompt and call `set_evaluation_from_evaluation_complete(evaluator_response)` with the result.
+- If the user agrees, present exactly these two numbered options and wait for the user to choose:
+  *"Which path works for you?"*
+  *"1. With AWS credentials (Interactive UI + Auto-Judge)"*
+  *"2. Without AWS credentials (LLM-generated evaluation)"*
+
+#### CRITICAL ROUTING RULES:
+- **If the user picks 1**: You MUST follow Path A below. Do NOT call `start_evaluation()`. Do NOT skip to Path B.
+- **If the user picks 2**: You MUST follow Path B below. Do NOT call `launch_interactive_ui()`.
+
+#### Path A: With AWS Credentials (Interactive UI + Auto-Judge)
+- **Step A1**: Call `launch_interactive_ui()` to start the Interactive UI with a fresh judgment cache. Tell the user the URL.
+- **Step A2**: Tell the user they can enter their AWS credentials directly in the UI by clicking the **🔑 AWS** button in the evaluation panel (visible after running a search). Credentials are sent to the local websocket server only and not stored on disk.
+- **Step A3**: Tell the user to click **📊 Evaluate All** in the Interactive UI to auto-judge all queries, then review the dashboard.
+- **Step A4**: Tell the user: *"When you're done reviewing, click **🚀 Send to Kiro** in the dashboard, then come back here and let me know."*
+- **Step A5**: When the user responds after clicking Send to Kiro, call `get_interactive_evaluation()` to pull the results into the engine. The response includes `next_action` and `next_action_prompt` — follow those instructions to automatically present the restart-or-deploy choice to the user.
+- Do NOT ask the user to configure AWS credentials via the terminal or paste them into the chat. The UI handles credential input directly.
+
+#### Path B: Without AWS Credentials (LLM-Generated Evaluation)
+- Call `start_evaluation()` to have the client LLM analyze the plan and verification queries.
+- If `start_evaluation()` returns `manual_evaluation_required=true`, act as the evaluator using the returned prompt and call `set_evaluation_from_evaluation_complete(evaluator_response)`.
+
+#### After Evaluation (both paths)
 - Present the evaluation findings to the user, including:
   - `search_quality_summary`: overall quality narrative
   - `issues`: identified problems or gaps
   - `suggested_preferences`: recommended `set_preferences` arguments for a fresh iteration
-- If `suggested_preferences` is non-empty, offer to start over with the new preferences:
-  *"Based on the evaluation, I suggest restarting with updated preferences to improve search quality. Would you like to try again?"*
+- If `suggested_preferences` is non-empty, offer to start over with the new preferences. Present the specific changes and ask:
+  *"The evaluation suggests restarting with these preference changes: [list changes]. This will affect hybrid weights, model selection, and pipeline configuration. Would you like to restart with these improvements?"*
 - If the user agrees to restart, go back to Phase 1 (`load_sample`) and apply the suggested preferences automatically in Phase 2.
 - If the user declines evaluation or declines to restart, proceed to Phase 5.
 
 ### Phase 5: Deploy to AWS OpenSearch (optional)
 - After successful local execution, offer to deploy the search strategy to AWS OpenSearch.
-- **Important**: Before starting Phase 5, guide the user to add AWS MCP servers to the power's mcp.json configuration (see AWS Setup in Onboarding section). Verify the servers are configured before proceeding.
+- **Important**: If the user already configured AWS credentials during Phase 4.5 Path A, skip credential setup. Otherwise, guide the user through the AWS Setup in the Onboarding section before proceeding.
 - Call `prepare_aws_deployment()` to get the deployment context. This returns:
   - `deployment_target`: "serverless" or "domain" (determined automatically from search strategy)
   - `search_strategy`: the detected strategy (bm25, neural_sparse, dense_vector, hybrid, agentic)
@@ -298,8 +318,10 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 - Provide the user with AWS endpoint URLs and access instructions.
 
 ### Post-Execution
-- After successful execution completion, explicitly tell the user
-  how to access the UI using the returned `ui_access` URLs.
+- After successful Phase 4 execution, show the standalone Search Builder UI URL
+  from `ui_access.primary_url` (e.g. `http://localhost:8765`).
+  Do NOT show the interactive UI URL here — the interactive UI is only
+  offered in Phase 4.5 Path A via `launch_interactive_ui`.
 - `cleanup()` removes test documents when the user explicitly asks.
 - After Phase 5 AWS deployment, provide AWS endpoint URLs and configuration details.
 - After Phase 5, call `connect_search_ui_to_endpoint(endpoint, port, use_ssl, username, password, index_name)` to switch the Search UI to the AWS endpoint so the user can test searches against the cloud deployment directly from the same UI. The UI header badge will update to show "AWS Cloud" with a green connection dot.
@@ -320,6 +342,7 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 | `retry_execution` | 4 | Resume from a failed execution step |
 | `start_evaluation` | 4.5 | Evaluate search quality; may return `manual_evaluation_required` with evaluator prompt |
 | `set_evaluation_from_evaluation_complete` | 4.5 | Parse/store evaluator output for manual evaluation mode |
+| `get_interactive_evaluation` | 4.5 | Pull evaluation dashboard results from Interactive UI into the engine (after user runs Evaluate All) |
 | `prepare_aws_deployment` | 5 | Get deployment target, local config, steering file list, and state template for AWS deployment |
 | `connect_search_ui_to_endpoint` | 5 | Switch Search UI to query an AWS OpenSearch endpoint after deployment |
 | `cleanup` | Post | Remove test documents on user request |

@@ -150,8 +150,10 @@ Use the opensearch-launchpad MCP tools to guide the user from requirements to a 
 - If execution fails, the user can fix the issue (e.g., restart Docker) and call `retry_execution()`.
 
 ### Post-Execution
-- After successful execution completion, explicitly tell the user
-  how to access the UI using the returned `ui_access` URLs.
+- After successful Phase 4 execution, show the standalone Search Builder UI URL
+  from `ui_access.primary_url` (e.g. `http://localhost:8765`).
+  Do NOT show the interactive UI URL here — the interactive UI is only
+  offered in Phase 4.5 Path A via `launch_interactive_ui`.
 - `cleanup()` removes test/verification documents when the user explicitly asks.
 
 ### Optional: Evaluate Search Quality (Phase 4.5)
@@ -167,6 +169,8 @@ Use the opensearch-launchpad MCP tools to guide the user from requirements to a 
   - `suggested_preferences`: recommended `set_preferences` args for a fresh start
 - After showing the evaluation, ask the user if they want to start over with the suggested preferences.
   - If yes, call `set_preferences(...)` with the suggested values and restart from Phase 3 (planning).
+    The evaluation findings (quality summary, issues, and suggested changes) are automatically
+    injected into the planning context so the planner can address them in the new proposal.
   - If no, continue to Phase 5 (AWS deployment) or stop.
 
 ### Optional: Deploy to AWS (Phase 5)
@@ -835,17 +839,32 @@ class _ClientSamplingPlannerAgent:
         return str(result.get("response", ""))
 
 
-def _build_ui_access_payload() -> dict[str, object]:
+def _build_ui_access_payload(*, interactive: bool = False) -> dict[str, object]:
+    """Build UI access URLs.
+
+    Args:
+        interactive: When True (Phase 4.5), the interactive UI is primary.
+                     When False (Phase 4 default), the standalone UI is primary.
+    """
     public_host = "localhost" if SEARCH_UI_HOST in {"0.0.0.0", "::"} else SEARCH_UI_HOST
-    urls: list[str] = []
+    standalone_url = f"http://{public_host}:{SEARCH_UI_PORT}"
+    interactive_urls: list[str] = []
     for host in (public_host, "127.0.0.1", "localhost"):
         url = f"http://{host}:{SEARCH_UI_PORT}/interactive.html"
-        if url not in urls:
-            urls.append(url)
+        if url not in interactive_urls:
+            interactive_urls.append(url)
+    if interactive:
+        return {
+            "primary_url": interactive_urls[0],
+            "alternate_urls": interactive_urls[1:],
+            "standalone_url": standalone_url,
+        }
     return {
-        "primary_url": urls[0],
-        "alternate_urls": urls[1:],
-        "fallback_url": f"http://{public_host}:{SEARCH_UI_PORT}",
+        "primary_url": standalone_url,
+        "alternate_urls": [standalone_url.replace(public_host, "127.0.0.1")]
+        if public_host != "127.0.0.1"
+        else [],
+        "interactive_url": interactive_urls[0],
     }
 
 
@@ -894,6 +913,9 @@ def _launch_interactive_ui_background() -> None:
             launch_search_ui_impl()
     except Exception:
         pass
+
+    # Push AWS credentials to the WebSocket server if available
+    _push_aws_credentials_to_ws()
 
 
 def _build_manual_llm_payload(
@@ -1578,9 +1600,9 @@ async def apply_capability_driven_verification(
 
 @mcp.tool()
 def launch_search_ui(index_name: str = "") -> str:
-    """Launch Search Builder UI."""
-    with _temporary_execution_auth_env():
-        return launch_search_ui_impl(index_name=index_name)
+    """Launch Search Builder UI (standalone mode)."""
+    result = launch_search_ui_impl(index_name=index_name)
+    return result
 
 
 @mcp.tool()
@@ -1938,6 +1960,101 @@ def set_evaluation_from_evaluation_complete(evaluator_response: str) -> dict:
 
 
 @mcp.tool()
+def get_interactive_evaluation() -> dict:
+    """Retrieve the evaluation dashboard results from the Interactive UI and store them
+    in the engine so the MCP workflow can act on them (offer restart with suggested
+    preferences or proceed to AWS deployment).
+
+    Call this after the user has run 'Evaluate All' in the Interactive UI and reviewed
+    the dashboard.  The tool reads the stored summary from the websocket server,
+    converts it into the engine's evaluation format, and persists it.
+
+    Returns:
+        dict with status, evaluation result (search_quality_summary, issues,
+        suggested_preferences), and the raw dashboard summary.
+    """
+    if _engine.plan_result is None:
+        return {"error": "No finalized plan available. Complete Phase 4 first."}
+
+    try:
+        ws_data = _ws_request_sync("get_eval_summary", timeout=5.0)
+    except Exception as exc:
+        return {"error": f"Cannot reach WebSocket server: {exc}. Is the interactive UI running?"}
+
+    if ws_data.get("type") == "error":
+        return {"error": ws_data.get("message", "No evaluation summary available.")}
+
+    summary = ws_data.get("summary", {})
+    if not summary:
+        return {"error": "No evaluation summary available. Run 'Evaluate All' in the Interactive UI first."}
+
+    dims = summary.get("dimensions", {})
+    dim_lines = []
+    for key in ("relevance", "query_coverage", "ranking_quality", "capability_gaps"):
+        d = dims.get(key, {})
+        if d:
+            label = key.replace("_", " ").title()
+            dim_lines.append(f"{label}: [{d.get('score', '?')}/5] - {d.get('detail', '')}")
+    search_quality_summary = "\n".join(dim_lines) if dim_lines else summary.get("verdict", "")
+
+    issue_lines = []
+    for rec in summary.get("recommendations", []):
+        area = rec.get("area", "")
+        issue = rec.get("issue", "")
+        action = rec.get("action", "")
+        if issue:
+            issue_lines.append(f"[{area}] {issue} → {action}")
+    issues_text = "\n".join(issue_lines)
+
+    # Merge suggested preference changes from recommendations
+    suggested_preferences: dict[str, str] = {}
+    for rec in summary.get("recommendations", []):
+        pref_change = rec.get("preference_change", {})
+        if isinstance(pref_change, dict):
+            suggested_preferences.update({str(k): str(v) for k, v in pref_change.items() if v})
+
+    result = _engine.set_evaluation(
+        search_quality_summary=search_quality_summary,
+        issues=issues_text,
+        suggested_preferences=suggested_preferences or None,
+    )
+    _persist_engine_state("get_interactive_evaluation")
+
+    # Attach the raw dashboard data for the agent to present
+    result["dashboard"] = {
+        "overall_score": summary.get("overall_score"),
+        "verdict": summary.get("verdict"),
+        "avg_precision": summary.get("avg_precision"),
+        "avg_ndcg": summary.get("avg_ndcg"),
+        "queries_evaluated": summary.get("queries_evaluated"),
+        "capability_breakdown": summary.get("capability_breakdown"),
+        "recommendations": summary.get("recommendations"),
+        "current_config": summary.get("current_config"),
+    }
+    if suggested_preferences:
+        result["suggested_preferences"] = suggested_preferences
+        pref_desc = ", ".join(f"{k}={v}" for k, v in suggested_preferences.items())
+        result["next_action"] = "offer_restart"
+        result["next_action_prompt"] = (
+            f"The evaluation found issues and suggests restarting with updated preferences: {pref_desc}. "
+            "Present the evaluation findings and these two options to the user:\n"
+            "1. Restart with suggested improvements (will re-run Phases 2-4 with new preferences)\n"
+            "2. Skip and proceed to Phase 5 (AWS deployment)\n"
+            "If the user picks 1, call set_preferences(...) with the suggested values, then "
+            "start_planning(). The evaluation findings (quality summary, issues, suggested changes) "
+            "are automatically injected into the planning context so the planner addresses them."
+        )
+    else:
+        result["next_action"] = "proceed_to_phase5"
+        result["next_action_prompt"] = (
+            "Evaluation looks good with no suggested preference changes. "
+            "Offer to proceed to Phase 5 (AWS deployment) or let the user explore the search UI further."
+        )
+
+    return result
+
+
+@mcp.tool()
 def prepare_aws_deployment() -> dict:
     """Prepare structured context for deploying the local search strategy to AWS OpenSearch.
     Call after successful Phase 4 execution.
@@ -1950,6 +2067,113 @@ def prepare_aws_deployment() -> dict:
     if "error" not in result:
         _persist_engine_state("prepare_aws_deployment")
     return result
+
+
+def _push_aws_credentials_to_ws() -> None:
+    """Forward AWS credentials to the WebSocket server for Bedrock Auto-Judge.
+
+    The WebSocket server runs as a detached subprocess and may not inherit
+    the MCP server's environment (especially when Kiro spawns the MCP
+    process).  This resolves credentials from multiple sources in order:
+
+    1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, etc.)
+    2. boto3 default credential chain (~/.aws/credentials, IAM role, etc.)
+    3. AWS CLI ``aws configure export-credentials`` (refreshes from SSO/Isengard)
+
+    Each source is validated with a lightweight STS call.  The first valid
+    set of credentials is pushed to the websocket server.
+    """
+    import subprocess as _sp
+
+    def _try_env() -> tuple[str, str, str, str]:
+        return (
+            os.environ.get("AWS_ACCESS_KEY_ID", ""),
+            os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+            os.environ.get("AWS_SESSION_TOKEN", ""),
+            os.environ.get("AWS_DEFAULT_REGION")
+            or os.environ.get("AWS_REGION", ""),
+        )
+
+    def _try_boto3() -> tuple[str, str, str, str]:
+        try:
+            import boto3
+            session = boto3.Session()
+            creds = session.get_credentials()
+            if creds:
+                frozen = creds.get_frozen_credentials()
+                return (
+                    frozen.access_key or "",
+                    frozen.secret_key or "",
+                    frozen.token or "",
+                    session.region_name or "",
+                )
+        except Exception:
+            pass
+        return ("", "", "", "")
+
+    def _try_cli_export() -> tuple[str, str, str, str]:
+        """Use ``aws configure export-credentials`` to get fresh tokens."""
+        try:
+            result = _sp.run(
+                ["aws", "configure", "export-credentials", "--format", "env"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                return ("", "", "", "")
+            ak = sk = st = region = ""
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("export "):
+                    line = line[7:]
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                val = val.strip().strip('"').strip("'")
+                if key == "AWS_ACCESS_KEY_ID":
+                    ak = val
+                elif key == "AWS_SECRET_ACCESS_KEY":
+                    sk = val
+                elif key == "AWS_SESSION_TOKEN":
+                    st = val
+                elif key in ("AWS_DEFAULT_REGION", "AWS_REGION"):
+                    region = val
+            return (ak, sk, st, region)
+        except Exception:
+            return ("", "", "", "")
+
+    def _validate(ak: str, sk: str, st: str, region: str) -> bool:
+        if not ak or not sk:
+            return False
+        try:
+            import boto3
+            s = boto3.Session(
+                aws_access_key_id=ak,
+                aws_secret_access_key=sk,
+                aws_session_token=st or None,
+                region_name=region or "us-east-1",
+            )
+            s.client("sts").get_caller_identity()
+            return True
+        except Exception:
+            return False
+
+    # Try each source in priority order
+    for resolver in (_try_env, _try_boto3, _try_cli_export):
+        ak, sk, st, region = resolver()
+        if ak and sk and _validate(ak, sk, st, region or "us-east-1"):
+            payload = {
+                "access_key": ak,
+                "secret_key": sk,
+                "region": region or "us-east-1",
+                "session_token": st,
+            }
+            try:
+                _ws_request_sync("set_credentials", payload, timeout=3.0)
+            except Exception:
+                pass
+            return
+
+    # No valid credentials found — Auto-Judge will fail with a clear error
 
 
 @mcp.tool()
@@ -2007,6 +2231,16 @@ def launch_interactive_ui() -> str:
     with _temporary_execution_auth_env():
         launch_search_ui_impl()
 
+    # Clear judgment cache for a fresh evaluation session
+    try:
+        _ws_request_sync("clear_judgments", timeout=3.0)
+    except Exception:
+        pass
+
+    # Push AWS credentials from environment to the WebSocket server so
+    # boto3 in the subprocess can authenticate for Bedrock Auto-Judge.
+    _push_aws_credentials_to_ws()
+
     url = f"http://{SEARCH_UI_HOST}:{SEARCH_UI_PORT}/interactive.html"
 
     try:
@@ -2031,6 +2265,156 @@ The UI is now open in your browser. You can:
 3. Monitor the connection status in the header
 
 Note: The WebSocket server is {ws_status} on ws://{ws_host}:{ws_port}"""
+
+
+def _ws_request_sync(action: str, payload: dict | None = None, timeout: float = 5.0) -> dict:
+    """Send a request to the WebSocket server and return the response (sync helper)."""
+    import asyncio
+
+    async def _do() -> dict:
+        import websockets
+        msg = {"action": action}
+        if payload:
+            msg.update(payload)
+        async with websockets.connect("ws://127.0.0.1:8766") as ws:
+            # Drain the welcome "connected" message the server sends on connect
+            welcome = await asyncio.wait_for(ws.recv(), timeout=timeout)
+            _ = welcome  # discard
+            # Now send our request and read the actual response
+            await ws.send(json.dumps(msg))
+            raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+            return json.loads(raw)
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(asyncio.run, _do()).result(timeout=timeout + 2)
+        return loop.run_until_complete(_do())
+    except Exception:
+        return asyncio.run(_do())
+
+
+@mcp.tool()
+def get_search_results_for_judgment() -> dict:
+    """Get the current search results from the UI for LLM-as-judge evaluation.
+    Call this when the user wants to auto-judge search results.
+
+    Returns the query, query_mode, and a list of documents (with vectors stripped)
+    ready for the client LLM to judge relevance. The client LLM should return
+    judgments as a JSON object mapping doc_id to 1 (relevant) or 0 (irrelevant),
+    then call set_auto_judgments() to push the colors to the UI.
+
+    Returns:
+        dict with query, query_mode, documents list, and a judgment_prompt for the client LLM.
+    """
+    try:
+        ctx = _ws_request_sync("get_search_context")
+    except Exception as exc:
+        return {"error": f"Cannot reach WebSocket server: {exc}. Is the interactive UI running?"}
+
+    if ctx.get("type") == "error":
+        return {"error": ctx.get("message", "Unknown error from WebSocket server.")}
+
+    query = ctx.get("query", "")
+    query_mode = ctx.get("query_mode", "")
+    hits = ctx.get("hits", [])
+
+    if not hits:
+        return {"error": "No search results available. Run a search in the UI first."}
+    if not query:
+        return {"error": "No query found. Run a search in the UI first."}
+
+    # Build clean doc list without vectors
+    docs = []
+    for hit in hits:
+        doc_id = str(hit.get("_id") or hit.get("id") or "")
+        src = hit.get("_source") or hit.get("source") or {}
+        fields = {}
+        for k, v in src.items():
+            if v in (None, "", "\\N"):
+                continue
+            if isinstance(v, list) and v and isinstance(v[0], (int, float)):
+                continue
+            if isinstance(v, dict) and v and all(isinstance(val, (int, float)) for val in v.values()):
+                continue
+            fields[k] = v
+        docs.append({"id": doc_id, "fields": fields})
+
+    # Build the judgment prompt
+    doc_lines = [f'  id={d["id"]} | {json.dumps(d["fields"], ensure_ascii=False)[:400]}' for d in docs]
+    prompt = (
+        f'Query: "{query}"\n'
+        f'Query mode: {query_mode}\n\n'
+        f'Documents:\n' + "\n".join(doc_lines) + "\n\n"
+        "For each document, decide if it is relevant (1) or not relevant (0) to the query.\n\n"
+        "Query type guidance:\n"
+        "- Semantic queries (e.g. 'early silent films'): judge by topical relevance.\n"
+        "- Exact/term queries (e.g. 'tt0000001'): relevant if the doc contains that exact value.\n"
+        "- Structured filter queries (e.g. 'tconst: tt0000002'): relevant if the field matches exactly.\n"
+        "- Combined queries (e.g. 'tconst: tt0000008 and titleType: short'): relevant if ALL conditions match.\n\n"
+        "Return a JSON object mapping doc_id to 1 or 0. Example:\n"
+        '{"tt0000001": 1, "tt0000002": 0}\n'
+    )
+
+    return {
+        "query": query,
+        "query_mode": query_mode,
+        "document_count": len(docs),
+        "documents": docs,
+        "judgment_prompt": prompt,
+    }
+
+
+@mcp.tool()
+def set_auto_judgments(judgments_json: str) -> dict:
+    """Push LLM-generated relevance judgments to the Search UI.
+    Call this after judging results from get_search_results_for_judgment().
+
+    The UI will update result card colors: green border for relevant (1),
+    red border for irrelevant (0).
+
+    Args:
+        judgments_json: JSON string mapping doc_id to 1 (relevant) or 0 (irrelevant).
+            Example: '{"tt0000001": 1, "tt0000002": 0}'
+
+    Returns:
+        dict with status and count of judgments pushed.
+    """
+    try:
+        judgments = json.loads(judgments_json)
+    except (json.JSONDecodeError, TypeError):
+        return {"error": "Invalid JSON. Provide a JSON object mapping doc_id to 0 or 1."}
+
+    if not isinstance(judgments, dict):
+        return {"error": "Expected a JSON object mapping doc_id to 0 or 1."}
+
+    # Validate values
+    clean: dict[str, int] = {}
+    for k, v in judgments.items():
+        if v in (0, 1, "0", "1"):
+            clean[str(k)] = int(v)
+
+    if not clean:
+        return {"error": "No valid judgments found. Values must be 0 or 1."}
+
+    # Push to WebSocket server which broadcasts to UI clients
+    try:
+        resp = _ws_request_sync("push_judgments", {"judgments": clean})
+    except Exception as exc:
+        return {
+            "status": f"Judgments prepared but could not push to UI: {exc}",
+            "count": len(clean),
+            "judgments": clean,
+        }
+
+    return {
+        "status": "Judgments pushed to UI.",
+        "count": len(clean),
+        "sent_to_clients": resp.get("sent_to", 0),
+        "judgments": clean,
+    }
 
 
 @mcp.tool()

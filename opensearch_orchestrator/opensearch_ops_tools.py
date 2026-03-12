@@ -5686,6 +5686,12 @@ def index_verification_docs(
 
 def launch_search_ui(index_name: str = "") -> str:
     """Launch local React Search Builder UI for interactive testing."""
+    # Clear judgment cache so the UI starts fresh after each execution
+    try:
+        from opensearch_orchestrator.websocket_server import _judgment_cache
+        _judgment_cache.clear()
+    except Exception:
+        pass
     try:
         launch = _ensure_search_ui_server(index_name)
         url = str(launch.get("url", _search_ui_public_url()))
