@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenSearch Launchpad - Interactive</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Inter+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+  <style>
+    /* Size input inside the panel index-row */
+    .iui-size-label {
+      font-size: 13px;
+      color: hsl(var(--muted-foreground));
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+      font-family: var(--font-sans);
+    }
+
+    .iui-size-input {
+      width: 56px;
+      border: 1px solid hsl(var(--input));
+      border-radius: var(--radius-xl);
+      padding: 6px 8px;
+      font-size: 13px;
+      font-family: var(--font-sans);
+      background: hsl(var(--background));
+      color: hsl(var(--foreground));
+      outline: none;
+    }
+
+    /* Result rank badge */
+    .iui-result-rank {
+      min-width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      background: hsl(var(--muted));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      color: hsl(var(--muted-foreground));
+      font-weight: 600;
+      flex-shrink: 0;
+    }
+
+    .iui-result-body { flex: 1; min-width: 0; }
+
+    .iui-result-id {
+      font-size: 11px;
+      color: hsl(var(--muted-foreground));
+      margin-top: 2px;
+      font-family: var(--font-mono);
+    }
+
+    .iui-result-json {
+      margin-top: 6px;
+      padding: 8px;
+      background: hsl(var(--secondary));
+      border-radius: var(--radius-lg);
+      font-size: 12px;
+      font-family: var(--font-mono);
+      overflow: auto;
+      max-height: 200px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: hsl(var(--foreground));
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script type="text/babel" src="/interactive-app.jsx"></script>
+</body>
+</html>

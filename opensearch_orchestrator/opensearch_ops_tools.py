@@ -4468,6 +4468,12 @@ def _resolve_search_ui_asset(path: str) -> Path | None:
     normalized = path.strip()
     if normalized in {"", "/"}:
         normalized = "/index.html"
+    elif normalized == "/interactive.html":
+        # Serve interactive UI
+        normalized = "/interactive.html"
+    elif normalized == "/interactive-app.jsx":
+        # Serve interactive app script
+        normalized = "/interactive-app.jsx"
 
     relative_path = normalized.lstrip("/")
     candidate = (SEARCH_UI_STATIC_DIR / relative_path).resolve()
@@ -5680,6 +5686,12 @@ def index_verification_docs(
 
 def launch_search_ui(index_name: str = "") -> str:
     """Launch local React Search Builder UI for interactive testing."""
+    # Clear judgment cache so the UI starts fresh after each execution
+    try:
+        from opensearch_orchestrator.websocket_server import _judgment_cache
+        _judgment_cache.clear()
+    except Exception:
+        pass
     try:
         launch = _ensure_search_ui_server(index_name)
         url = str(launch.get("url", _search_ui_public_url()))

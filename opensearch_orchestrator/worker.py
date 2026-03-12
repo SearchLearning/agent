@@ -1115,8 +1115,7 @@ SAMPLE_CONTEXT = """
 **Embedding Model:**
 - Deployment: SageMaker GPU Endpoint
 - Model Options:
-  - Primary: intfloat/e5-large-v2 (1024 dimensions, state-of-the-art English)
-  - Alternative: sentence-transformers/all-mpnet-base-v2 (768 dimensions)
+  - Primary: sentence-transformers/all-mpnet-base-v2 (768 dimensions)
 - Inference: GPU-based for 5-20ms latency
 
 **BM25 Configuration:**
