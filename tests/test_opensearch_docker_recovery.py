@@ -281,7 +281,7 @@ def test_create_client_auth_failure_does_not_bootstrap_docker(monkeypatch):
     monkeypatch.setattr(tools, "_build_client", _build)
     monkeypatch.setattr(tools, "_start_local_opensearch_container", _start_container)
 
-    with pytest.raises(RuntimeError, match="Authentication failed"):
+    with pytest.raises(RuntimeError, match="authentication failed"):
         tools._create_client()
 
     assert docker_called is False

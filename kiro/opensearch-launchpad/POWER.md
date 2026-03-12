@@ -259,6 +259,10 @@ This power provides an OpenSearch Search Solution building workflow. It collects
   - manual path: call `set_plan_from_planning_complete(planner_response)` with the finalized planner output
 
 ### Phase 4: Execute
+- **Before execution**, call `preflight_check_cluster()` to detect any existing OpenSearch cluster on the configured host:port.
+  - If `status` is `"available"`: a cluster is reachable. Inform the user and proceed with execution using the detected cluster.
+  - If `status` is `"auth_required"`: a cluster is running but credentials failed. Ask the user for their username and password, then call `preflight_check_cluster(localhost_auth_mode="custom", localhost_auth_username="...", localhost_auth_password="...")`. If the second call returns `"available"`, credentials are persisted in-process for all subsequent tool calls — no restart needed. If it still fails, offer to bootstrap a fresh local cluster instead.
+  - If `status` is `"no_cluster"`: nothing is listening. Execution will automatically bootstrap a local Docker cluster.
 - Call `execute_plan()` to run index/model/pipeline/UI setup.
 - If `execute_plan()` returns manual execution bootstrap payload, follow it and then call `set_execution_from_execution_report(worker_response, execution_context)` to persist normalized execution state.
 - If execution fails, the user can fix the issue (e.g., restart Docker) and call `retry_execution()`.
@@ -300,7 +304,7 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 ### Post-Execution
 - After successful execution completion, explicitly tell the user
   how to access the UI using the returned `ui_access` URLs.
-- `cleanup()` removes test documents when the user explicitly asks.
+- `cleanup()` removes test documents and clears any in-process cluster credentials when the user explicitly asks.
 - After Phase 5 AWS deployment, provide AWS endpoint URLs and configuration details.
 - After Phase 5, call `connect_search_ui_to_endpoint(endpoint, port, use_ssl, username, password, index_name)` to switch the Search UI to the AWS endpoint so the user can test searches against the cloud deployment directly from the same UI. The UI header badge will update to show "AWS Cloud" with a green connection dot.
 
@@ -315,6 +319,7 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 | `refine_plan` | 3 | Send user feedback to refine the proposal |
 | `finalize_plan` | 3 | Finalize the plan when the user confirms |
 | `set_plan_from_planning_complete` | 3 | Parse/store finalized planner output for manual planning mode |
+| `preflight_check_cluster` | 4 | Check if an OpenSearch cluster is already running; accepts optional `localhost_auth_mode`/`localhost_auth_username`/`localhost_auth_password` for custom creds |
 | `execute_plan` | 4 | Execute the plan (create index, models, pipelines, UI) |
 | `set_execution_from_execution_report` | 4 | Parse/store finalized worker output for manual execution mode |
 | `retry_execution` | 4 | Resume from a failed execution step |
@@ -322,7 +327,7 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 | `set_evaluation_from_evaluation_complete` | 4.5 | Parse/store evaluator output for manual evaluation mode |
 | `prepare_aws_deployment` | 5 | Get deployment target, local config, steering file list, and state template for AWS deployment |
 | `connect_search_ui_to_endpoint` | 5 | Switch Search UI to query an AWS OpenSearch endpoint after deployment |
-| `cleanup` | Post | Remove test documents on user request |
+| `cleanup` | Post | Remove test documents and clear session credentials on user request |
 
 ### Knowledge Tools
 | Tool | Description |

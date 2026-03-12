@@ -20,6 +20,28 @@ from urllib.parse import parse_qs, urlparse
 
 from opensearch_orchestrator.tools import get_sample_docs_payload, normalize_ingest_source_field_hints
 
+
+class ClusterAuthError(RuntimeError):
+    """Raised when an existing cluster is detected but authentication fails.
+
+    Attributes:
+        host: The OpenSearch host that was probed.
+        port: The OpenSearch port that was probed.
+    """
+
+    def __init__(self, host: str, port: int, message: str | None = None) -> None:
+        self.host = host
+        self.port = port
+        super().__init__(
+            message
+            or (
+                f"An OpenSearch cluster is running at {host}:{port} but authentication "
+                f"failed. Provide valid credentials via OPENSEARCH_AUTH_MODE=custom with "
+                f"OPENSEARCH_USER and OPENSEARCH_PASSWORD, or use "
+                f"OPENSEARCH_AUTH_MODE=none if security is disabled."
+            )
+        )
+
 OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "localhost")
 OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", "9200"))
 OPENSEARCH_AUTH_MODE_ENV = "OPENSEARCH_AUTH_MODE"
@@ -686,6 +708,175 @@ def _is_local_host(host: str) -> bool:
     return host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 
 
+def preflight_check_cluster(
+    auth_mode: str = "",
+    username: str = "",
+    password: str = "",
+) -> dict[str, object]:
+    """Probe the configured OpenSearch host:port before execution.
+
+    On the first call (no auth args), probes with no-auth and default creds.
+    If the result is ``auth_required``, the caller should ask the user for
+    credentials and call again with ``auth_mode="custom"``, ``username``,
+    and ``password``.  When custom creds succeed the function sets
+    ``OPENSEARCH_AUTH_MODE``, ``OPENSEARCH_USER``, and ``OPENSEARCH_PASSWORD``
+    as in-process environment variables so every subsequent tool call
+    (``create_index``, ``execute_plan``, etc.) picks them up automatically
+    via ``_resolve_http_auth_from_env()``.
+
+    Args:
+        auth_mode: ``""`` (auto-detect), ``"none"``, or ``"custom"``.
+        username: Required when auth_mode is ``"custom"``.
+        password: Required when auth_mode is ``"custom"``.
+
+    Returns:
+        dict with status, host, port, is_local, message, auth_modes_tried,
+        and auth_mode (when status is "available").
+    """
+    host = OPENSEARCH_HOST
+    port = OPENSEARCH_PORT
+    is_local = _is_local_host(host)
+    result: dict[str, object] = {"host": host, "port": port, "is_local": is_local}
+
+    normalized_mode = str(auth_mode or "").strip().lower()
+
+    # --- Caller-supplied custom credentials ---
+    if normalized_mode == "custom":
+        user = str(username or "").strip()
+        pwd = str(password or "").strip()
+        if not user or not pwd:
+            result["status"] = "error"
+            result["message"] = (
+                "auth_mode='custom' requires both username and password."
+            )
+            result["auth_modes_tried"] = []
+            return result
+
+        custom_auth = (user, pwd)
+        for use_ssl in (True, False):
+            client = _build_client(use_ssl=use_ssl, http_auth=custom_auth)
+            ok, _ = _can_connect(client)
+            if ok:
+                # Persist creds in-process for all subsequent tool calls.
+                os.environ[OPENSEARCH_AUTH_MODE_ENV] = OPENSEARCH_AUTH_MODE_CUSTOM
+                os.environ[OPENSEARCH_USER_ENV] = user
+                os.environ[OPENSEARCH_PASSWORD_ENV] = pwd
+                ssl_label = "SSL" if use_ssl else "HTTP"
+                result["status"] = "available"
+                result["auth_mode"] = "custom"
+                result["message"] = (
+                    f"Connected to OpenSearch at {host}:{port} ({ssl_label}) "
+                    f"with provided credentials. Credentials set for this session."
+                )
+                result["auth_modes_tried"] = [
+                    f"custom_{'ssl' if use_ssl else 'http'}"
+                ]
+                return result
+
+        result["status"] = "auth_required"
+        result["message"] = (
+            f"OpenSearch cluster at {host}:{port} rejected the provided "
+            f"credentials. Please verify username/password and try again."
+        )
+        result["auth_modes_tried"] = ["custom_ssl", "custom_http"]
+        return result
+
+    # --- Caller-supplied no-auth mode ---
+    if normalized_mode == "none":
+        for use_ssl in (False, True):
+            client = _build_client(use_ssl=use_ssl, http_auth=None)
+            ok, _ = _can_connect(client)
+            if ok:
+                os.environ[OPENSEARCH_AUTH_MODE_ENV] = OPENSEARCH_AUTH_MODE_NONE
+                os.environ.pop(OPENSEARCH_USER_ENV, None)
+                os.environ.pop(OPENSEARCH_PASSWORD_ENV, None)
+                ssl_label = "SSL" if use_ssl else "HTTP"
+                result["status"] = "available"
+                result["auth_mode"] = "none"
+                result["message"] = (
+                    f"Connected to OpenSearch at {host}:{port} ({ssl_label}) "
+                    f"with no authentication. Auth mode set for this session."
+                )
+                result["auth_modes_tried"] = [
+                    f"none_{'ssl' if use_ssl else 'http'}"
+                ]
+                return result
+
+        result["status"] = "auth_required"
+        result["message"] = (
+            f"Could not connect to OpenSearch at {host}:{port} without "
+            f"authentication. The cluster may require credentials."
+        )
+        result["auth_modes_tried"] = ["none_http", "none_ssl"]
+        return result
+
+    # --- Auto-detect (no auth args supplied) ---
+    auth_modes_tried: list[str] = []
+    saw_auth_failure = False
+
+    default_auth = (OPENSEARCH_DEFAULT_USER, OPENSEARCH_DEFAULT_PASSWORD)
+    probes: list[tuple[bool, tuple[str, str] | None, str]] = [
+        (False, None, "none_http"),
+        (True, None, "none_ssl"),
+        (True, default_auth, "default_ssl"),
+        (False, default_auth, "default_http"),
+    ]
+
+    for use_ssl, http_auth, label in probes:
+        auth_modes_tried.append(label)
+        client = _build_client(use_ssl=use_ssl, http_auth=http_auth)
+        ok, auth_fail = _can_connect(client)
+        if ok:
+            mode_name = "none" if http_auth is None else "default"
+            ssl_label = "SSL" if use_ssl else "HTTP"
+            if http_auth is None:
+                detail = f"with security disabled (no auth, {ssl_label})"
+                os.environ[OPENSEARCH_AUTH_MODE_ENV] = OPENSEARCH_AUTH_MODE_NONE
+                os.environ.pop(OPENSEARCH_USER_ENV, None)
+                os.environ.pop(OPENSEARCH_PASSWORD_ENV, None)
+            else:
+                detail = f"({ssl_label}) using default credentials"
+                os.environ[OPENSEARCH_AUTH_MODE_ENV] = OPENSEARCH_AUTH_MODE_DEFAULT
+                os.environ.pop(OPENSEARCH_USER_ENV, None)
+                os.environ.pop(OPENSEARCH_PASSWORD_ENV, None)
+            result["status"] = "available"
+            result["auth_mode"] = mode_name
+            result["message"] = (
+                f"OpenSearch cluster detected at {host}:{port} {detail}."
+            )
+            result["auth_modes_tried"] = auth_modes_tried
+            return result
+        if auth_fail:
+            saw_auth_failure = True
+
+    result["auth_modes_tried"] = auth_modes_tried
+    if saw_auth_failure:
+        result["status"] = "auth_required"
+        result["message"] = (
+            f"OpenSearch cluster detected at {host}:{port} but authentication "
+            f"failed with all attempted credentials. Please provide your "
+            f"credentials or allow bootstrapping a new local cluster."
+        )
+    else:
+        result["status"] = "no_cluster"
+        result["message"] = (
+            f"No OpenSearch cluster detected at {host}:{port}. "
+            f"A local cluster can be bootstrapped via Docker."
+        )
+    return result
+
+
+def clear_cluster_credentials() -> None:
+    """Remove in-process cluster credentials set by ``preflight_check_cluster``.
+
+    Call this at the end of a session (e.g. from ``cleanup()``) so credentials
+    do not linger in the MCP server process environment.
+    """
+    os.environ.pop(OPENSEARCH_AUTH_MODE_ENV, None)
+    os.environ.pop(OPENSEARCH_USER_ENV, None)
+    os.environ.pop(OPENSEARCH_PASSWORD_ENV, None)
+
+
 def _get_backend_info() -> dict[str, object]:
     """Return connection metadata describing whether the backend is local or cloud."""
     override_host = _search_ui.endpoint_override_host
@@ -701,9 +892,25 @@ def _get_backend_info() -> dict[str, object]:
 
     connected = False
     try:
-        client = _create_client()
-        ok, _ = _can_connect(client)
-        connected = ok
+        # Probe connectivity without triggering Docker bootstrap.
+        # _create_client() falls through to _start_local_opensearch_container()
+        # when direct connections fail, which would hang or start an unwanted
+        # container during a lightweight health-check.  Instead, replicate the
+        # same SSL/non-SSL probe logic used by _create_client() but stop after
+        # the connection attempts.  A short timeout prevents the probe from
+        # blocking the UI health endpoint (which itself has a 2 s budget).
+        if override_host:
+            client = _create_client()
+            ok, _ = _can_connect(client)
+            connected = ok
+        else:
+            http_auth = _resolve_http_auth_from_env()
+            for use_ssl in (True, False):
+                probe = _build_client(use_ssl=use_ssl, http_auth=http_auth)
+                ok, _ = _can_connect(probe)
+                if ok:
+                    connected = True
+                    break
     except Exception:
         pass
 
@@ -1197,9 +1404,9 @@ def _create_client() -> OpenSearch:
         return insecure_client
 
     if secure_auth_failure or insecure_auth_failure:
-        raise RuntimeError(
-            "Authentication failed while connecting to OpenSearch at "
-            f"{OPENSEARCH_HOST}:{OPENSEARCH_PORT}."
+        raise ClusterAuthError(
+            host=OPENSEARCH_HOST,
+            port=OPENSEARCH_PORT,
         )
 
     # Direct connection attempts failed without auth errors, so bootstrap local OpenSearch with Docker.
@@ -4700,6 +4907,17 @@ def _ensure_search_ui_server(preferred_index: str = "") -> dict[str, object]:
             _stop_ui_process_on_port()
             listeners = _list_listener_pids_on_ui_port()
             if listeners:
+                # Last resort: force-kill any listener whose command looks like
+                # our UI server module.  This handles orphaned processes from
+                # previous MCP sessions where the lock file was already cleaned
+                # but the process survived.
+                for pid in list(listeners):
+                    cmd = _get_process_command(pid)
+                    if cmd and (_UI_SERVER_MODULE in cmd or _UI_SERVER_SCRIPT_NAME in cmd):
+                        _terminate_process(pid)
+                listeners = _list_listener_pids_on_ui_port()
+
+            if listeners:
                 conflict_pid = listeners[0]
                 conflict_cmd = _get_process_command(conflict_pid)
                 raise RuntimeError(
@@ -4708,6 +4926,18 @@ def _ensure_search_ui_server(preferred_index: str = "") -> dict[str, object]:
                 )
 
         instance_id = uuid.uuid4().hex
+        _ensure_ui_runtime_dir()
+
+        # Ensure the subprocess can locate the opensearch_orchestrator package
+        # even when sys.executable points to an isolated venv (e.g. uv-managed
+        # MCP environment) that doesn't have the package installed.
+        _project_root = str(Path(__file__).resolve().parent.parent)
+        _sub_env = os.environ.copy()
+        _existing_pp = _sub_env.get("PYTHONPATH", "")
+        _sub_env["PYTHONPATH"] = (
+            f"{_project_root}{os.pathsep}{_existing_pp}" if _existing_pp else _project_root
+        )
+
         subprocess.Popen(
             [
                 sys.executable,
@@ -4718,6 +4948,7 @@ def _ensure_search_ui_server(preferred_index: str = "") -> dict[str, object]:
                 "--idle-timeout-seconds",
                 str(SEARCH_UI_IDLE_TIMEOUT_SECONDS),
             ],
+            env=_sub_env,
             start_new_session=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

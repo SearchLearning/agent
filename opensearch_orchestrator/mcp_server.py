@@ -60,6 +60,9 @@ from opensearch_orchestrator.tools import (
 from opensearch_orchestrator.opensearch_ops_tools import (
     SEARCH_UI_HOST,
     SEARCH_UI_PORT,
+    ClusterAuthError,
+    preflight_check_cluster as preflight_check_cluster_impl,
+    clear_cluster_credentials as clear_cluster_credentials_impl,
     create_index as create_index_impl,
     create_and_attach_pipeline as create_and_attach_pipeline_impl,
     create_bedrock_embedding_model as create_bedrock_embedding_model_impl,
@@ -145,6 +148,10 @@ Use the opensearch-launchpad MCP tools to guide the user from requirements to a 
   This returns {solution, search_capabilities, keynote}.
 
 ### Phase 4: Execute
+- **Before execution**, call `preflight_check_cluster()` to detect any existing OpenSearch cluster on the configured host:port.
+  - If `status` is `"available"`: a cluster is reachable — proceed with execution.
+  - If `status` is `"auth_required"`: a cluster is running but credentials failed. Ask the user for their username and password, then call `preflight_check_cluster(localhost_auth_mode="custom", localhost_auth_username=..., localhost_auth_password=...)`. If the second call succeeds, credentials are set in-process for all subsequent tool calls.
+  - If `status` is `"no_cluster"`: nothing is listening — execution will bootstrap a local Docker cluster automatically.
 - Call `execute_plan()` to run index/model/pipeline/UI setup.
 - If `execute_plan()` returns manual execution bootstrap payload, follow it and then commit the final worker response via `set_execution_from_execution_report(worker_response, execution_context)`.
 - If execution fails, the user can fix the issue (e.g., restart Docker) and call `retry_execution()`.
@@ -152,7 +159,7 @@ Use the opensearch-launchpad MCP tools to guide the user from requirements to a 
 ### Post-Execution
 - After successful execution completion, explicitly tell the user
   how to access the UI using the returned `ui_access` URLs.
-- `cleanup()` removes test/verification documents when the user explicitly asks.
+- `cleanup()` removes test/verification documents and clears any in-process cluster credentials when the user explicitly asks.
 
 ### Optional: Evaluate Search Quality (Phase 4.5)
 - After Phase 4 completes, ask the user if they want to evaluate search quality.
@@ -1248,6 +1255,49 @@ def set_plan_from_planning_complete(planner_response: str, additional_context: s
 
 
 @mcp.tool()
+def preflight_check_cluster(
+    localhost_auth_mode: str = "",
+    localhost_auth_username: str = "",
+    localhost_auth_password: str = "",
+) -> dict:
+    """Check if an OpenSearch cluster is already running on the configured host:port.
+
+    Call this BEFORE execute_plan to detect existing clusters and avoid port
+    conflicts when bootstrapping a new local Docker cluster.
+
+    On the first call (no auth args), probes with no-auth and default creds.
+    If the result is ``auth_required``, ask the user for credentials and call
+    again with ``localhost_auth_mode="custom"`` plus username/password.
+    When custom creds succeed, they are persisted in-process for all subsequent
+    tool calls (create_index, execute_plan, etc.) — no restart needed.
+
+    Args:
+        localhost_auth_mode: ``""`` (auto-detect), ``"none"``, or ``"custom"``.
+            - default: use localhost default credentials admin/myStrongPassword123!
+            - none: force no authentication
+            - custom: use localhost_auth_username/localhost_auth_password
+        localhost_auth_username: Username for localhost custom auth mode.
+        localhost_auth_password: Password for localhost custom auth mode.
+
+    Returns:
+        dict with:
+          - status: "available" (cluster reachable), "auth_required" (cluster
+            found but credentials rejected), or "no_cluster" (nothing listening).
+          - host / port: the endpoint that was probed.
+          - is_local: whether the host is localhost.
+          - message: human-readable summary.
+          - auth_modes_tried: list of auth approaches attempted.
+          - auth_mode: (only when status is "available") which auth succeeded
+            ("none", "default", or "custom").
+    """
+    return preflight_check_cluster_impl(
+        auth_mode=localhost_auth_mode,
+        username=localhost_auth_username,
+        password=localhost_auth_password,
+    )
+
+
+@mcp.tool()
 async def execute_plan(additional_context: str = "") -> dict:
     """Build manual execution bootstrap for the finalized plan.
     Call after finalize_plan, set_plan, or set_plan_from_planning_complete.
@@ -1910,8 +1960,15 @@ def cleanup() -> str:
     Returns:
         str: Cleanup result message.
     """
+    # Stop the UI server first so it doesn't survive with stale credentials.
+    try:
+        cleanup_ui_server_impl()
+    except Exception:
+        pass
     with _temporary_execution_auth_env():
-        return cleanup_docs_impl()
+        result = cleanup_docs_impl()
+    clear_cluster_credentials_impl()
+    return result
 
 
 # Expose minimal knowledge tools by default for MCP manual planning/execution flows.
